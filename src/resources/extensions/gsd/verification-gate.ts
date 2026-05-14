@@ -202,7 +202,7 @@ export function formatFailureContext(result: VerificationResult): string {
 // ─── Gate Execution ─────────────────────────────────────────────────────────
 
 /** Characters that indicate shell injection when found in a command string. */
-const SHELL_INJECTION_PATTERN = /[;`<>]|\$\(/;
+const SHELL_INJECTION_PATTERN = /[;`<>]|\$\(|\|\|/;
 
 /**
  * Known executable first-tokens that are safe to run.
@@ -335,7 +335,9 @@ export function runVerificationGate(options: RunVerificationGateOptions): Verifi
     // Pass the command string as an argument to the shell explicitly
     // to avoid Node.js DEP0190 (spawnSync with shell: true and no args).
     const shellBin = process.platform === "win32" ? "cmd" : "sh";
-    const shellArgs = process.platform === "win32" ? ["/c", rewrittenCommand] : ["-c", rewrittenCommand];
+    const shellArgs = process.platform === "win32"
+      ? ["/c", rewrittenCommand]
+      : ["-c", `set -o pipefail 2>/dev/null && ${rewrittenCommand}`];
     const result: SpawnSyncReturns<string> = spawnSync(shellBin, shellArgs, {
       cwd: options.cwd,
       stdio: "pipe",
