@@ -174,6 +174,36 @@ test("ADR-011: refining + flag flipped OFF mid-milestone → falls through to pl
   }
 });
 
+test("ADR-011: refining + existing PLAN heals stale sketch flag and skips dispatch", async (t) => {
+  const originalCwd = process.cwd();
+  const base = makeFixtureBase();
+  t.after(() => cleanup(base, originalCwd));
+
+  seedMilestoneWithSketchedS02(base);
+  writeS01Artifacts(base);
+  writePreferences(base, "phases:\n  progressive_planning: true");
+  writeFileSync(
+    join(base, ".gsd", "milestones", "M001", "slices", "S02", "S02-PLAN.md"),
+    "# S02 Plan\n",
+  );
+  process.chdir(base);
+
+  const state = await deriveStateFromDb(base);
+  assert.equal(state.phase, "refining");
+  assert.equal(getSlice("M001", "S02")?.is_sketch, 1, "pre: stale sketch flag");
+
+  const ctx: DispatchContext = {
+    basePath: base,
+    mid: "M001",
+    midTitle: "Test",
+    state,
+    prefs: { phases: { progressive_planning: true, reassess_after_slice: false } } as any,
+  };
+  const result = await resolveDispatch(ctx);
+  assert.equal(result.action, "skip");
+  assert.equal(getSlice("M001", "S02")?.is_sketch, 0, "post: sketch flag healed");
+});
+
 test("ADR-011: autoHealSketchFlags flips is_sketch=0 when PLAN file exists", async (t) => {
   const originalCwd = process.cwd();
   const base = makeFixtureBase();
