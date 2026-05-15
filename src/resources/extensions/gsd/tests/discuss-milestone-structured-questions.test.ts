@@ -35,6 +35,15 @@ function makeContext(
   };
 }
 
+function setGsdHeadless(t: { after: (fn: () => void) => void }): void {
+  const previous = process.env.GSD_HEADLESS;
+  process.env.GSD_HEADLESS = "1";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GSD_HEADLESS;
+    else process.env.GSD_HEADLESS = previous;
+  });
+}
+
 test("auto-dispatch passes structuredQuestionsAvailable=true into discuss-milestone prompt", async (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "gsd-discuss-milestone-structured-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -67,12 +76,7 @@ test("auto-dispatch uses discuss-headless prompt when GSD_HEADLESS is set", asyn
   const tmp = mkdtempSync(join(tmpdir(), "gsd-discuss-milestone-headless-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
 
-  const previous = process.env.GSD_HEADLESS;
-  process.env.GSD_HEADLESS = "1";
-  t.after(() => {
-    if (previous === undefined) delete process.env.GSD_HEADLESS;
-    else process.env.GSD_HEADLESS = previous;
-  });
+  setGsdHeadless(t);
 
   const result = await resolveDispatch(makeContext(tmp, "pre-planning", "true"));
 
@@ -86,12 +90,7 @@ test("auto-dispatch uses discuss-headless prompt for needs-discussion when GSD_H
   const tmp = mkdtempSync(join(tmpdir(), "gsd-discuss-milestone-headless-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
 
-  const previous = process.env.GSD_HEADLESS;
-  process.env.GSD_HEADLESS = "1";
-  t.after(() => {
-    if (previous === undefined) delete process.env.GSD_HEADLESS;
-    else process.env.GSD_HEADLESS = previous;
-  });
+  setGsdHeadless(t);
 
   const result = await resolveDispatch(makeContext(tmp, "needs-discussion", "true"));
 
@@ -105,12 +104,7 @@ test("auto-dispatch uses discuss-headless prompt for executing when GSD_HEADLESS
   const tmp = mkdtempSync(join(tmpdir(), "gsd-discuss-milestone-headless-"));
   t.after(() => rmSync(tmp, { recursive: true, force: true }));
 
-  const previous = process.env.GSD_HEADLESS;
-  process.env.GSD_HEADLESS = "1";
-  t.after(() => {
-    if (previous === undefined) delete process.env.GSD_HEADLESS;
-    else process.env.GSD_HEADLESS = previous;
-  });
+  setGsdHeadless(t);
 
   const result = await resolveDispatch(makeContext(tmp, "executing", "true"));
 
