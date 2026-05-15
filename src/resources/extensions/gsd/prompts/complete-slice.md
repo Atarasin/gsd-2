@@ -24,7 +24,11 @@ Use `subagent` only for fresh-context review when useful: reviewer for cross-cut
 2. {{skillActivation}}
 3. Run all slice-level verification checks from the slice plan through the closeout-safe verification surface (`gsd_exec` / Context Mode verification evidence); refresh current state if needed. Do not use direct `bash` for verification commands.
 4. Complete the slice only when every required verification check passes. If verification fails or the fix requires source changes, do **not** edit source files in this unit and do **not** call `gsd_slice_complete`.
-5. For task-specific failures, call `gsd_task_reopen` with the failing completed task and a concrete reason so execution can redo the work. For plan-invalidating failures, call `gsd_replan_slice` with the blocker and updated execution tasks. Then stop with: "Slice {{sliceId}} needs execution follow-up."
+5. If verification fails:
+   - For task-specific regressions introduced by a completed task, call `gsd_task_reopen` with that task and a concrete reason so execution can redo the work.
+   - For inherited/out-of-scope failures (for example project-wide baseline failures not introduced by this slice), do **not** reopen completed tasks; call `gsd_replan_slice` with the blocker and adjusted verification scope or follow-up tasks.
+   - For other plan-invalidating failures, call `gsd_replan_slice` with the blocker and updated execution tasks.
+   Then stop with: "Slice {{sliceId}} needs execution follow-up."
 6. Task summaries use a flat file layout under `tasks/` such as `T01-SUMMARY.md`, not inside per-task subdirectories like `tasks/T01/SUMMARY.md`. Never use `tasks/*/SUMMARY.md`.
 7. If observability/diagnostics were planned, verify them unless the slice is simple.
 8. Address every gate in Gates to Close. Q8 maps to **Operational Readiness**: health signal, failure signal, recovery procedure, monitoring gaps. Empty sections are recorded as omitted.
