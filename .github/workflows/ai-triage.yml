@@ -41,6 +41,7 @@ jobs:
           script: |
             const fs = require('fs');
             const {
+              CANONICAL_TRIAGE_LABELS,
               TRIAGE_LABEL_COLORS,
               TRIAGE_LABEL_DESCRIPTIONS,
               normalizeTriageResult
@@ -77,9 +78,13 @@ jobs:
               }
             }
 
-            // Ensure all newly opened issues enter the canonical triage queue,
-            // even when they bypass issue templates (API/import/manual labeling).
-            if (isIssue && !existingLabels.includes('needs-triage')) {
+            const isNewIssue = context.eventName === 'issues' && context.payload.action === 'opened';
+            const hasCanonicalTriageStatus = existingLabels.some(label =>
+              CANONICAL_TRIAGE_LABELS.includes(label)
+            );
+
+            // Ensure new issues enter the canonical triage queue when no triage status exists.
+            if (isNewIssue && !hasCanonicalTriageStatus) {
               await ensureCanonicalLabels(['needs-triage']);
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
@@ -275,7 +280,7 @@ jobs:
             ---
             *This is an automated triage. The maintainers make all final decisions.*`;
 
-              const { data: comments } = await github.rest.issues.listComments({
+              const comments = await github.paginate(github.rest.issues.listComments, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: number,
