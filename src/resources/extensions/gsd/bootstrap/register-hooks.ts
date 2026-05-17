@@ -168,10 +168,32 @@ function isGsdManagedTool(name: string): boolean {
   return name.startsWith("gsd_") || name === "memory_query" || name === "capture_thought" || name === "gsd_graph";
 }
 
+function resolveScopedToolNames(
+  activeToolNames: readonly string[],
+  requestedToolNames: readonly string[],
+): string[] {
+  const exact = new Set(activeToolNames);
+  const resolved = new Set<string>();
+
+  for (const requested of requestedToolNames) {
+    if (exact.has(requested)) resolved.add(requested);
+
+    for (const activeName of activeToolNames) {
+      if (!activeName.startsWith("mcp__")) continue;
+      const toolSeparator = activeName.indexOf("__", "mcp__".length);
+      if (toolSeparator < 0) continue;
+      if (activeName.slice(toolSeparator + 2) === requested) {
+        resolved.add(activeName);
+      }
+    }
+  }
+
+  return [...resolved];
+}
+
 export function buildMinimalGsdToolSet(activeToolNames: readonly string[]): string[] {
-  const active = new Set(activeToolNames);
   const preserved = activeToolNames.filter((name) => !isGsdManagedTool(name));
-  const minimal = MINIMAL_GSD_TOOL_NAMES.filter((name) => active.has(name));
+  const minimal = resolveScopedToolNames(activeToolNames, MINIMAL_GSD_TOOL_NAMES);
   return [...new Set([...preserved, ...minimal])];
 }
 
@@ -179,19 +201,17 @@ export function buildMinimalAutoGsdToolSet(
   activeToolNames: readonly string[],
   unitType: string | undefined,
 ): string[] {
-  const active = new Set(activeToolNames);
   const unitTools = unitType ? AUTO_UNIT_SCOPED_TOOLS[unitType] ?? [] : [];
   const autoBaseTools = new Set<string>(MINIMAL_AUTO_BASE_TOOL_NAMES);
   const preserved = activeToolNames.filter((name) => autoBaseTools.has(name));
-  const scoped = [...MINIMAL_GSD_TOOL_NAMES, ...unitTools].filter((name) => active.has(name));
+  const scoped = resolveScopedToolNames(activeToolNames, [...MINIMAL_GSD_TOOL_NAMES, ...unitTools]);
   return [...new Set([...preserved, ...scoped])];
 }
 
 export function buildMinimalGsdWorkflowToolSet(activeToolNames: readonly string[]): string[] {
-  const active = new Set(activeToolNames);
   const autoBaseTools = new Set<string>(MINIMAL_AUTO_BASE_TOOL_NAMES);
   const preserved = activeToolNames.filter((name) => autoBaseTools.has(name));
-  const scoped = WORKFLOW_GSD_TOOL_NAMES.filter((name) => active.has(name));
+  const scoped = resolveScopedToolNames(activeToolNames, WORKFLOW_GSD_TOOL_NAMES);
   return [...new Set([...preserved, ...scoped])];
 }
 
