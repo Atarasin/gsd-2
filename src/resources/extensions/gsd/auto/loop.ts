@@ -102,6 +102,12 @@ import {
 import { handleCustomEngineReconcile } from "./workflow-custom-engine-reconcile.js";
 import { handleCustomEngineReconcileOutcome } from "./workflow-custom-engine-reconcile-outcome.js";
 
+/**
+ * Returns true if workerId is an active worker in this project whose OS
+ * process no longer exists. Used to detect dead lease holders before
+ * the heartbeat TTL expires. EPERM means the process is alive (we lack
+ * permission to signal it); any other kill(pid,0) error means dead.
+ */
 function isDeadLocalLeaseHolder(workerId: string, projectRoot: string): boolean {
   const worker = getAutoWorker(workerId);
   if (!worker) return false;
