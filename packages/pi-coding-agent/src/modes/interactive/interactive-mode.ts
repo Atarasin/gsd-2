@@ -329,6 +329,8 @@ export class InteractiveMode {
 	// Branch change listener unsubscribe function
 	private _branchChangeUnsub?: () => void;
 	private _themeChangeUnsub?: () => void;
+	private markdownThemeCache?: MarkdownTheme;
+	private markdownThemeCacheIndent?: string;
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
@@ -649,6 +651,7 @@ export class InteractiveMode {
 
 		// Set up theme file watcher
 		this._themeChangeUnsub = onThemeChange(() => {
+			this.clearMarkdownThemeCache();
 			this.ui.invalidate();
 			this.updateEditorBorderColor();
 			this.ui.requestRender();
@@ -847,10 +850,22 @@ export class InteractiveMode {
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
-		return {
+		const codeBlockIndent = this.settingsManager.getCodeBlockIndent();
+		if (this.markdownThemeCache && this.markdownThemeCacheIndent === codeBlockIndent) {
+			return this.markdownThemeCache;
+		}
+
+		this.markdownThemeCacheIndent = codeBlockIndent;
+		this.markdownThemeCache = {
 			...getMarkdownTheme(),
-			codeBlockIndent: this.settingsManager.getCodeBlockIndent(),
+			codeBlockIndent,
 		};
+		return this.markdownThemeCache;
+	}
+
+	private clearMarkdownThemeCache(): void {
+		this.markdownThemeCache = undefined;
+		this.markdownThemeCacheIndent = undefined;
 	}
 
 	// =========================================================================
@@ -3300,6 +3315,7 @@ export class InteractiveMode {
 					onThemeChange: (themeName) => {
 						const result = setTheme(themeName, true);
 						this.settingsManager.setTheme(themeName);
+						this.clearMarkdownThemeCache();
 						this.ui.invalidate();
 						if (!result.success) {
 							this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to dark theme.`);
@@ -3308,6 +3324,7 @@ export class InteractiveMode {
 					onThemePreview: (themeName) => {
 						const result = setTheme(themeName, true);
 						if (result.success) {
+							this.clearMarkdownThemeCache();
 							this.ui.invalidate();
 							this.ui.requestRender();
 						}
@@ -4022,6 +4039,7 @@ export class InteractiveMode {
 			this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
+			this.clearMarkdownThemeCache();
 			if (!themeResult.success) {
 				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
 			}

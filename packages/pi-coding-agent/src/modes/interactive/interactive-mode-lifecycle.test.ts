@@ -11,6 +11,7 @@ type RuntimeInteractiveMode = {
 	[key: string]: unknown;
 	stop(): void;
 	_themeChangeUnsub?: () => void;
+	getMarkdownThemeWithSettings(): unknown;
 };
 
 describe("InteractiveMode lifecycle", () => {
@@ -38,5 +39,25 @@ describe("InteractiveMode lifecycle", () => {
 
 		assert.equal(unsubscribeCount, 1);
 		assert.equal(mode._themeChangeUnsub, undefined);
+	});
+
+	it("caches markdown theme settings until the code block indent changes", () => {
+		const mode = Object.create(InteractiveMode.prototype) as RuntimeInteractiveMode;
+		let codeBlockIndent = "  ";
+		mode.session = {
+			settingsManager: {
+				getCodeBlockIndent: () => codeBlockIndent,
+			},
+		};
+
+		const first = mode.getMarkdownThemeWithSettings();
+		assert.equal(mode.getMarkdownThemeWithSettings(), first);
+
+		codeBlockIndent = "    ";
+		const updated = mode.getMarkdownThemeWithSettings() as { codeBlockIndent: string };
+
+		assert.notEqual(updated, first);
+		assert.equal(updated.codeBlockIndent, "    ");
+		assert.equal(mode.getMarkdownThemeWithSettings(), updated);
 	});
 });
