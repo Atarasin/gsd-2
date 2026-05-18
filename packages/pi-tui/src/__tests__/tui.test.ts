@@ -1,9 +1,12 @@
 // GSD-2 + packages/pi-tui/src/__tests__/tui.test.ts - Regression coverage for the TUI renderer and container lifecycle.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 
-import { Container, CURSOR_MARKER, TUI } from "../tui.js";
+import { Container, CURSOR_MARKER, pruneDebugRenderLogs, TUI } from "../tui.js";
 import type { Component } from "../tui.js";
 import type { Terminal } from "../terminal.js";
 
@@ -225,6 +228,31 @@ describe("TUI", () => {
 		assert.deepEqual(received, ["\x1b"]);
 		assert.equal(anyTui.cellSizeQueryPending, false);
 		assert.equal(anyTui.inputBuffer, "");
+	});
+
+	it("keeps only the newest TUI debug render logs", () => {
+		const debugDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-tui-debug-"));
+		try {
+			for (let i = 0; i < 5; i++) {
+				const filePath = path.join(debugDir, `render-${i}-debug.log`);
+				fs.writeFileSync(filePath, `debug ${i}`);
+				const time = new Date(1_700_000_000_000 + i * 1000);
+				fs.utimesSync(filePath, time, time);
+			}
+			fs.writeFileSync(path.join(debugDir, "keep-me.log"), "unrelated");
+
+			pruneDebugRenderLogs(debugDir, 3);
+
+			const remaining = fs.readdirSync(debugDir).sort();
+			assert.deepEqual(remaining, [
+				"keep-me.log",
+				"render-2-debug.log",
+				"render-3-debug.log",
+				"render-4-debug.log",
+			]);
+		} finally {
+			fs.rmSync(debugDir, { recursive: true, force: true });
+		}
 	});
 });
 

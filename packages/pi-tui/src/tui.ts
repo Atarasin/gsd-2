@@ -84,6 +84,33 @@ function warnOnRenderWidthOverflow(component: Component, lines: string[], width:
 	}
 }
 
+const DEBUG_RENDER_LOG_LIMIT = 50;
+const DEBUG_RENDER_LOG_PATTERN = /^render-\d+-[a-z0-9]+\.log$/;
+
+export function pruneDebugRenderLogs(debugDir: string, maxFiles = DEBUG_RENDER_LOG_LIMIT): void {
+	if (maxFiles < 1) return;
+	let entries: { name: string; mtimeMs: number }[];
+	try {
+		entries = fs.readdirSync(debugDir, { withFileTypes: true })
+			.filter((entry) => entry.isFile() && DEBUG_RENDER_LOG_PATTERN.test(entry.name))
+			.map((entry) => {
+				const fullPath = path.join(debugDir, entry.name);
+				return { name: entry.name, mtimeMs: fs.statSync(fullPath).mtimeMs };
+			});
+	} catch {
+		return;
+	}
+
+	entries.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+	for (const entry of entries.slice(maxFiles)) {
+		try {
+			fs.unlinkSync(path.join(debugDir, entry.name));
+		} catch {
+			// Debug log cleanup must never break rendering.
+		}
+	}
+}
+
 /**
  * Cursor position marker - APC (Application Program Command) sequence.
  * This is a zero-width escape sequence that terminals ignore.
@@ -1084,6 +1111,7 @@ export class TUI extends Container {
 				JSON.stringify(buffer),
 			].join("\n");
 			fs.writeFileSync(debugPath, debugData);
+			pruneDebugRenderLogs(debugDir);
 		}
 
 		// Write entire buffer at once
