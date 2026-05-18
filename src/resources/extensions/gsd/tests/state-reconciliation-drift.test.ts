@@ -37,6 +37,7 @@ import {
   ReconciliationFailedError,
   type DriftHandler,
   type DriftRecord,
+  type ReconciliationDeps,
 } from "../state-reconciliation.ts";
 import { classifyFailure } from "../recovery-classification.ts";
 import type { GSDState } from "../types.ts";
