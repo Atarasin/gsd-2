@@ -10,6 +10,36 @@ import { UserMessageComponent } from "../user-message.js";
 
 initTheme("dark", false);
 
+const OSC133_ZONE = /\x1b]133;[AB]\x07/;
+const ENV_KEYS = ["TERM_PROGRAM", "GSD_ENABLE_OSC133_ZONES", "GSD_DISABLE_OSC133_ZONES"] as const;
+
+function withEnv(values: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>, run: () => void): void {
+	const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]])) as Record<
+		(typeof ENV_KEYS)[number],
+		string | undefined
+	>;
+	try {
+		for (const key of ENV_KEYS) {
+			const value = values[key];
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+		run();
+	} finally {
+		for (const key of ENV_KEYS) {
+			const value = saved[key];
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+	}
+}
+
 describe("UserMessageComponent open surface", () => {
 	test("renders a user message as a copy-clean open surface", () => {
 		const component = new UserMessageComponent(
@@ -31,6 +61,38 @@ describe("UserMessageComponent open surface", () => {
 		assert.ok(
 			joined.split("\n").some((line) => line.includes("You") && line.includes("─")),
 			`expected a titled top rule carrying the You label:\n${joined}`,
+		);
+	});
+
+	test("does not inject OSC 133 zones for unsupported terminals", () => {
+		withEnv(
+			{
+				TERM_PROGRAM: "Apple_Terminal",
+				GSD_ENABLE_OSC133_ZONES: undefined,
+				GSD_DISABLE_OSC133_ZONES: undefined,
+			},
+			() => {
+				const component = new UserMessageComponent("Plain terminal output");
+				const joined = component.render(100).join("\n");
+
+				assert.doesNotMatch(joined, OSC133_ZONE);
+			},
+		);
+	});
+
+	test("can emit OSC 133 zones when explicitly enabled", () => {
+		withEnv(
+			{
+				TERM_PROGRAM: "Apple_Terminal",
+				GSD_ENABLE_OSC133_ZONES: "1",
+				GSD_DISABLE_OSC133_ZONES: undefined,
+			},
+			() => {
+				const component = new UserMessageComponent("Shell integration zone");
+				const joined = component.render(100).join("\n");
+
+				assert.match(joined, OSC133_ZONE);
+			},
 		);
 	});
 });

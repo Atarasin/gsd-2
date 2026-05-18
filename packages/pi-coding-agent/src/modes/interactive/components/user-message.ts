@@ -9,6 +9,12 @@ import { chatMessageWidth, renderUserRail } from "./transcript-design.js";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 
+function shouldEmitOsc133Zones(): boolean {
+	if (process.env.GSD_DISABLE_OSC133_ZONES === "1") return false;
+	if (process.env.GSD_ENABLE_OSC133_ZONES === "1") return true;
+	return process.env.TERM_PROGRAM === "iTerm.app";
+}
+
 /**
  * Component that renders a user message against the left edge of the chat transcript.
  */
@@ -40,6 +46,9 @@ export class UserMessageComponent extends Container {
 			return framed;
 		}
 		const out = ["", ...framed];
+		if (!shouldEmitOsc133Zones()) {
+			return out;
+		}
 		const firstFrameLine = 1;
 		const lastFrameLine = out.length - 1;
 		out[firstFrameLine] = OSC133_ZONE_START + out[firstFrameLine];
