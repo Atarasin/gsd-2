@@ -10,6 +10,7 @@ import { OAuthSelectorComponent } from "./oauth-selector.js";
 import { ShowImagesSelectorComponent } from "./show-images-selector.js";
 import { ThemeSelectorComponent } from "./theme-selector.js";
 import { ThinkingSelectorComponent } from "./thinking-selector.js";
+import { renderCursor } from "./tree-render-utils.js";
 import { UserMessageSelectorComponent } from "./user-message-selector.js";
 
 before(() => {
@@ -18,6 +19,10 @@ before(() => {
 
 function plain(component: Component): string {
 	return component.render(80).map((line) => stripVTControlCharacters(line)).join("\n");
+}
+
+function plainLines(component: Component): string[] {
+	return component.render(80).map((line) => stripVTControlCharacters(line));
 }
 
 function assertSelectorFooter(output: string): void {
@@ -38,6 +43,21 @@ describe("selector footers", () => {
 
 		for (const selector of selectors) {
 			assertSelectorFooter(plain(selector));
+		}
+	});
+
+	it("uses the shared selector cursor on simple row selectors", () => {
+		const cursor = stripVTControlCharacters(renderCursor(true));
+		const selectors: Component[] = [
+			new OAuthSelectorComponent("login", AuthStorage.inMemory(), () => {}, () => {}),
+			new UserMessageSelectorComponent([{ id: "1", text: "hello" }], () => {}, () => {}),
+		];
+
+		for (const selector of selectors) {
+			assert.ok(
+				plainLines(selector).some((line) => line.startsWith(cursor)),
+				`expected selected row to start with ${JSON.stringify(cursor)}`,
+			);
 		}
 	});
 });

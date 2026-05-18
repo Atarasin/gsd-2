@@ -5,6 +5,7 @@ import { type Component, Container, getEditorKeybindings, Spacer, Text, truncate
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { selectorFooter } from "./keybinding-hints.js";
+import { renderCursor } from "./tree-render-utils.js";
 
 interface UserMessageItem {
 	id: string; // Entry ID in the session
@@ -58,7 +59,7 @@ class UserMessageList implements Component {
 			const normalizedMessage = message.text.replace(/\n/g, " ").trim();
 
 			// First line: cursor + message
-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+			const cursor = renderCursor(isSelected);
 			const maxMsgWidth = Math.max(0, safeWidth - 2); // Account for cursor (2 chars)
 			const truncatedMsg = truncateToWidth(normalizedMessage, maxMsgWidth);
 			const messageLine = cursor + (isSelected ? theme.bold(truncatedMsg) : truncatedMsg);
