@@ -91,7 +91,7 @@ function isSamePathLocal(a: string, b: string): boolean {
 async function applyVerificationRetryPolicy(
   ic: IterationContext,
   unitType: string | undefined,
-  phase: "artifact-verification-retry" | "verification-retry",
+  phase: "artifact-verification-retry" | "verification-retry" | "pre-execution-retry",
 ): Promise<PhaseResult | null> {
   const { ctx, pi, s, deps } = ic;
   const retryInfo = s.pendingVerificationRetry;
@@ -2747,6 +2747,44 @@ export async function runFinalize(
   }
 
   const postResult = postResultGuard.value;
+
+  if (postResult === "retry") {
+    if (sidecarItem) {
+      debugLog("autoLoop", { phase: "sidecar-pre-execution-retry-skipped", iteration: ic.iteration });
+    } else {
+      const retryInfo = s.pendingVerificationRetry;
+      deps.emitJournalEvent({
+        ts: new Date().toISOString(),
+        flowId: ic.flowId,
+        seq: ic.nextSeq(),
+        eventType: "pre-execution-retry",
+        data: {
+          unitType: preUnitSnapshot?.type,
+          unitId: retryInfo?.unitId,
+          attempt: retryInfo?.attempt,
+        },
+      });
+      const retryPolicyResult = await applyVerificationRetryPolicy(
+        ic,
+        preUnitSnapshot?.type,
+        "pre-execution-retry",
+      );
+      if (retryPolicyResult) {
+        clearFinalizingUnit();
+        return retryPolicyResult;
+      }
+      rememberRetryDispatch(s, preUnitSnapshot, iterData);
+      debugLog("autoLoop", {
+        phase: "pre-execution-retry",
+        iteration: ic.iteration,
+        unitType: preUnitSnapshot?.type,
+        unitId: retryInfo?.unitId,
+        attempt: retryInfo?.attempt,
+      });
+      clearFinalizingUnit();
+      return { action: "continue" };
+    }
+  }
 
   if (postResult === "stopped") {
     debugLog("autoLoop", {

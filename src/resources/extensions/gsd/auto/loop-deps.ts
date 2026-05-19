@@ -288,7 +288,7 @@ export interface LoopDeps {
   ) => Promise<VerificationResult>;
   postUnitPostVerification: (
     pctx: PostUnitContext,
-  ) => Promise<"continue" | "step-wizard" | "stopped">;
+  ) => Promise<"continue" | "step-wizard" | "retry" | "stopped">;
 
   // Session manager
   getSessionFile: (ctx: ExtensionContext) => string;

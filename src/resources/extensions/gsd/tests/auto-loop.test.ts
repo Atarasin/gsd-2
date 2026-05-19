@@ -1928,6 +1928,84 @@ test("autoLoop replays artifact retry dispatch before deriving the next unit", a
   }
 });
 
+test("autoLoop replays pre-execution retry dispatch before deriving the next unit", async () => {
+  _resetPendingResolve();
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: 60_000 });
+
+  try {
+    const ctx = makeMockCtx();
+    ctx.ui.setStatus = () => {};
+    ctx.ui.notify = () => {};
+    ctx.sessionManager = { getSessionFile: () => "/tmp/session.json" };
+    const pi = makeMockPi();
+    const stateSnapshot = {
+      phase: "planning",
+      activeMilestone: { id: "M006", title: "Milestone 6", status: "active" },
+      activeSlice: { id: "S01", title: "Slice 1" },
+      activeTask: null,
+      registry: [{ id: "M006", status: "active" }],
+      blockers: [],
+    } as any;
+    const s = makeLoopSession({
+      currentMilestoneId: "M006",
+    });
+
+    let resolveDispatchCalls = 0;
+    let postVerificationCalls = 0;
+    const deps = makeMockDeps({
+      deriveState: async () => stateSnapshot,
+      resolveDispatch: async () => {
+        resolveDispatchCalls++;
+        return resolveDispatchCalls === 1
+          ? {
+              action: "dispatch" as const,
+              unitType: "plan-slice",
+              unitId: "M006/S01",
+              prompt: "plan slice prompt",
+            }
+          : {
+              action: "dispatch" as const,
+              unitType: "execute-task",
+              unitId: "M006/S01/T01",
+              prompt: "execute task prompt",
+            };
+      },
+      postUnitPostVerification: async () => {
+        postVerificationCalls++;
+        if (postVerificationCalls === 1) {
+          s.pendingVerificationRetry = {
+            unitId: "M006/S01",
+            failureContext: "Unsafe Verify command: grep alternation with |",
+            attempt: 1,
+          };
+          return "retry" as const;
+        }
+        s.active = false;
+        return "continue" as const;
+      },
+    });
+
+    const loopPromise = autoLoop(ctx, pi, s, deps);
+
+    await waitForMicrotasks(() => pi.calls.length === 1, "initial plan-slice dispatch");
+    resolveAgentEnd(makeEvent());
+    await drainMicrotasks(100);
+    mock.timers.tick(30_000);
+    await waitForMicrotasks(() => pi.calls.length === 2, "same planning retry dispatch");
+    resolveAgentEnd(makeEvent());
+    await loopPromise;
+
+    const secondPrompt = (pi.calls[1] as any[])[0].content;
+    assert.match(secondPrompt, /VERIFICATION FAILED/);
+    assert.match(secondPrompt, /Unsafe Verify command/);
+    assert.match(secondPrompt, /plan slice prompt/);
+    assert.doesNotMatch(secondPrompt, /execute task prompt/);
+    assert.equal(s.pendingVerificationRetryDispatch, null);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test("autoLoop releases orchestration active unit before artifact retry", async () => {
   _resetPendingResolve();
   mock.timers.enable({ apis: ["Date", "setTimeout"], now: 80_000 });
