@@ -17,7 +17,7 @@ import type { GSDPreferences } from "./preferences.js";
 import type { UatType } from "./files.js";
 import type { MinimalModelRegistry } from "./context-budget.js";
 import { loadFile, extractUatType, loadActiveOverrides } from "./files.js";
-import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone, insertAssessment, transaction } from "./gsd-db.js";
+import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone, insertAssessment, transaction, getAssessment } from "./gsd-db.js";
 import { isClosedStatus } from "./status-guards.js";
 import { extractVerdict, isAcceptableUatVerdict } from "./verdict-parser.js";
 
@@ -232,6 +232,16 @@ async function readUatGateVerdict(
 
   const assessmentContent = assessmentFile ? await loadFile(assessmentFile) : null;
   if (assessmentContent) {
+    // `reassess-roadmap` writes roadmap-scoped assessments to the same
+    // S##-ASSESSMENT artifact path; those verdicts must not be treated as UAT.
+    const assessmentRow = getAssessment(relSliceFile(basePath, mid, sliceId, "ASSESSMENT"));
+    const assessmentScope = typeof assessmentRow?.["scope"] === "string"
+      ? String(assessmentRow["scope"]).trim().toLowerCase()
+      : "";
+    if (assessmentScope === "roadmap") {
+      return null;
+    }
+
     const assessmentVerdict = extractVerdict(assessmentContent);
     if (assessmentVerdict) {
       return {
