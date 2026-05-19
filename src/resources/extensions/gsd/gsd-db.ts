@@ -111,6 +111,7 @@ const providerLoader = createSqliteProviderLoader({
 });
 
 export const SCHEMA_VERSION = 29;
+const TERMINAL_STATUS_SQL = "'complete', 'done', 'skipped', 'closed'";
 
 function initSchema(db: DbAdapter, fileBacked: boolean, dbPath: string | null): void {
   const conservativeFilePragmas = fileBacked && _isLikelyWslDrvFsPathForTest(dbPath);
@@ -1038,12 +1039,13 @@ export function insertMilestone(m: {
   });
 }
 
-export function upsertMilestonePlanning(milestoneId: string, planning: Partial<MilestonePlanningRecord> & { title?: string; status?: string }): void {
+export function upsertMilestonePlanning(milestoneId: string, planning: Partial<MilestonePlanningRecord> & { title?: string; status?: string; depends_on?: string[] }): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
   currentDb.prepare(
     `UPDATE milestones SET
       title = COALESCE(NULLIF(:title, ''), title),
       status = COALESCE(NULLIF(:status, ''), status),
+      depends_on = COALESCE(:depends_on, depends_on),
       vision = COALESCE(:vision, vision),
       success_criteria = COALESCE(:success_criteria, success_criteria),
       key_risks = COALESCE(:key_risks, key_risks),
@@ -1060,6 +1062,7 @@ export function upsertMilestonePlanning(milestoneId: string, planning: Partial<M
     ":id": milestoneId,
     ":title": planning.title ?? "",
     ":status": planning.status ?? "",
+    ":depends_on": planning.depends_on ? JSON.stringify(planning.depends_on) : null,
     ":vision": planning.vision ?? null,
     ":success_criteria": planning.successCriteria ? JSON.stringify(planning.successCriteria) : null,
     ":key_risks": planning.keyRisks ? JSON.stringify(planning.keyRisks) : null,
@@ -1100,7 +1103,7 @@ export function insertSlice(s: {
     )
     ON CONFLICT (milestone_id, id) DO UPDATE SET
       title = CASE WHEN :raw_title IS NOT NULL THEN excluded.title ELSE slices.title END,
-      status = CASE WHEN slices.status IN ('complete', 'done') THEN slices.status ELSE excluded.status END,
+      status = CASE WHEN slices.status IN (${TERMINAL_STATUS_SQL}) THEN slices.status ELSE excluded.status END,
       risk = CASE WHEN :raw_risk IS NOT NULL THEN excluded.risk ELSE slices.risk END,
       depends = excluded.depends,
       demo = CASE WHEN :raw_demo IS NOT NULL THEN excluded.demo ELSE slices.demo END,
@@ -1251,7 +1254,10 @@ export function insertTask(t: {
       expected_output = CASE WHEN NULLIF(:expected_output, '[]') IS NOT NULL THEN :expected_output ELSE tasks.expected_output END,
       observability_impact = CASE WHEN NULLIF(:observability_impact, '') IS NOT NULL THEN :observability_impact ELSE tasks.observability_impact END,
       sequence = :sequence,
-      target_repositories = CASE WHEN NULLIF(:target_repositories, '[]') IS NOT NULL THEN :target_repositories ELSE tasks.target_repositories END`,
+      target_repositories = CASE
+        WHEN :raw_target_repositories IS NOT NULL THEN :target_repositories
+        ELSE tasks.target_repositories
+      END`,
   ).run({
     ":milestone_id": t.milestoneId,
     ":slice_id": t.sliceId,
@@ -1278,6 +1284,10 @@ export function insertTask(t: {
     ":observability_impact": t.planning?.observabilityImpact ?? "",
     ":sequence": t.sequence ?? 0,
     ":target_repositories": JSON.stringify(t.planning?.targetRepositories ?? []),
+    ":raw_target_repositories":
+      t.planning && "targetRepositories" in t.planning
+        ? JSON.stringify(t.planning.targetRepositories ?? [])
+        : null,
   });
 }
 
@@ -1634,7 +1644,7 @@ export function updateMilestoneStatus(milestoneId: string, status: string, compl
 export function getActiveMilestoneFromDb(): MilestoneRow | null {
   if (!currentDb) return null;
   const row = currentDb.prepare(
-    "SELECT * FROM milestones WHERE status NOT IN ('complete', 'parked') ORDER BY id LIMIT 1",
+    "SELECT * FROM milestones WHERE status NOT IN ('complete', 'done', 'skipped', 'closed', 'parked') ORDER BY id LIMIT 1",
   ).get();
   if (!row) return null;
   return rowToMilestone(row);
@@ -1690,7 +1700,7 @@ export function getArtifact(path: string): ArtifactRow | null {
 export function getActiveMilestoneIdFromDb(): IdStatusSummary | null {
   if (!currentDb) return null;
   const row = currentDb.prepare(
-    "SELECT id, status FROM milestones WHERE status NOT IN ('complete', 'parked') ORDER BY id LIMIT 1",
+    "SELECT id, status FROM milestones WHERE status NOT IN ('complete', 'done', 'skipped', 'closed', 'parked') ORDER BY id LIMIT 1",
   ).get();
   if (!row) return null;
   return rowToIdStatusSummary(row);
@@ -1907,16 +1917,16 @@ export function reconcileWorktreeDb(
           )
           SELECT w.id, w.title,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.status ELSE w.status
                  END,
                  w.depends_on,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.created_at ELSE w.created_at
                  END,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.completed_at ELSE w.completed_at
                  END,
                  w.vision, w.success_criteria, w.key_risks, w.proof_strategy,
@@ -1940,12 +1950,12 @@ export function reconcileWorktreeDb(
           )
           SELECT w.milestone_id, w.id, w.title,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.status ELSE w.status
                  END,
                  w.risk, w.depends, w.demo, w.created_at,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.completed_at ELSE w.completed_at
                  END,
                  w.full_summary_md, w.full_uat_md, w.goal, w.success_criteria, w.proof_level,
@@ -1967,26 +1977,27 @@ export function reconcileWorktreeDb(
             verification_result, duration, completed_at, blocker_discovered,
             deviations, known_issues, key_files, key_decisions, full_summary_md,
             description, estimate, files, verify, inputs, expected_output,
-            observability_impact, full_plan_md, sequence, target_repositories,
+            observability_impact, full_plan_md, target_repositories, sequence,
             blocker_source, escalation_pending, escalation_awaiting_review,
             escalation_artifact_path, escalation_override_applied_at
           )
           SELECT w.milestone_id, w.slice_id, w.id, w.title,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.status ELSE w.status
                  END,
                  w.one_liner, w.narrative,
                  w.verification_result, w.duration,
                  CASE
-                   WHEN m.status IN ('complete', 'done') AND w.status NOT IN ('complete', 'done')
+                   WHEN m.status IN (${TERMINAL_STATUS_SQL}) AND w.status NOT IN (${TERMINAL_STATUS_SQL})
                    THEN m.completed_at ELSE w.completed_at
                  END,
                  w.blocker_discovered,
                  w.deviations, w.known_issues, w.key_files, w.key_decisions, w.full_summary_md,
                  w.description, w.estimate, w.files, w.verify, w.inputs, w.expected_output,
-                 w.observability_impact, w.full_plan_md, w.sequence,
+                 w.observability_impact, w.full_plan_md,
                  ${hasTaskTargetRepositories ? "COALESCE(w.target_repositories, m.target_repositories, '[]')" : "COALESCE(m.target_repositories, '[]')"},
+                 w.sequence,
                  ${hasBlockerSource ? "w.blocker_source" : "COALESCE(m.blocker_source, '')"},
                  ${hasEscalationPending ? "w.escalation_pending" : "COALESCE(m.escalation_pending, 0)"},
                  ${hasEscalationAwaiting ? "w.escalation_awaiting_review" : "COALESCE(m.escalation_awaiting_review, 0)"},
