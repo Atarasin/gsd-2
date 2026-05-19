@@ -20,7 +20,7 @@
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { TaskRow } from "./db-task-slice-rows.js";
 import type { PreExecutionCheckJSON } from "./verification-evidence.ts";
 import { validateVerificationCommand } from "./verification-gate.js";
@@ -40,6 +40,25 @@ export interface PreExecutionResult {
 
 export interface PreExecutionCheckContext {
   additionalRoots?: string[];
+  canonicalProjectRoot?: string;
+}
+
+function inputExistsOnDisk(
+  normalizedFile: string,
+  basePath: string,
+  context?: PreExecutionCheckContext,
+): boolean {
+  if (existsSync(resolve(basePath, normalizedFile))) return true;
+
+  // Worktree mode: a referenced file may live at the canonical project root
+  // rather than inside the isolated worktree checkout — either project
+  // metadata (.gsd/...) or source from already-merged work that has not yet
+  // reached this worktree. Accept either as satisfying the input.
+  if (context?.canonicalProjectRoot) {
+    if (existsSync(resolve(context.canonicalProjectRoot, normalizedFile))) return true;
+  }
+
+  return (context?.additionalRoots ?? []).some((root) => existsSync(resolve(root, normalizedFile)));
 }
 
 export function checkVerificationCommands(tasks: TaskRow[]): PreExecutionCheckJSON[] {
@@ -375,7 +394,7 @@ function extractPathFromAnnotation(raw: string): string {
     return quoteMatch[2].trim();
   }
 
-  const annotatedMatch = trimmed.match(/^(.+?)\s+[—–-]\s+.+$/);
+  const annotatedMatch = trimmed.match(/^(.+?)(?:\s+[—–-]\s+.+|\s+\([^()]+\))$/);
   if (annotatedMatch) {
     const prefix = annotatedMatch[1].trim();
     const prefixBacktickMatch = prefix.match(/`([^`]+)`/);
@@ -449,6 +468,14 @@ function containsGlobPattern(candidate: string): boolean {
   return ["*", "?", "[", "]", "{", "}"].some((char) => candidate.includes(char));
 }
 
+function toComparisonPath(filePath: string, basePath: string): string {
+  const normalized = normalizeFilePath(filePath);
+  if (!isAbsolute(normalized)) return normalized;
+  const normalizedBasePath = normalizeFilePath(basePath);
+  const rel = normalizeFilePath(relative(normalizedBasePath, normalized));
+  return rel && !rel.startsWith("..") && rel !== "." ? rel : normalized;
+}
+
 /**
  * Build a set of files that will be created by tasks up to (but not including) taskIndex.
  * Also includes outputs of completed tasks at any position — a completed task has already
@@ -488,7 +515,6 @@ export function checkFilePathConsistency(
   context?: PreExecutionCheckContext,
 ): PreExecutionCheckJSON[] {
   const results: PreExecutionCheckJSON[] = [];
-  const resolutionRoots = [basePath, ...(context?.additionalRoots ?? [])];
 
   // Build a set of all files created by any task at any position (normalized).
   // Used to suppress consistency errors for files that will be caught with a
@@ -496,14 +522,16 @@ export function checkFilePathConsistency(
   const allTaskOutputs = new Set<string>();
   for (const t of tasks) {
     for (const f of t.expected_output) {
-      allTaskOutputs.add(normalizeFilePath(f));
+      allTaskOutputs.add(toComparisonPath(f, basePath));
     }
   }
 
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
-    const priorOutputs = getExpectedOutputsUpTo(tasks, i);
-    const ownOutputs = new Set<string>(task.expected_output.map(normalizeFilePath));
+    const priorOutputs = new Set<string>(
+      Array.from(getExpectedOutputsUpTo(tasks, i), (filePath) => toComparisonPath(filePath, basePath)),
+    );
+    const ownOutputs = new Set<string>(task.expected_output.map((filePath) => toComparisonPath(filePath, basePath)));
     const filesToCheck = [...task.inputs];
 
     for (const file of filesToCheck) {
@@ -512,11 +540,11 @@ export function checkFilePathConsistency(
       if (!shouldValidateInputAsPath(file)) continue;
 
       // Normalize path for consistent comparison
-      const normalizedFile = normalizeFilePath(file);
+      const normalizedFile = toComparisonPath(file, basePath);
       if (containsGlobPattern(normalizedFile)) continue;
 
       // Check if file exists on disk
-      const existsOnDisk = resolutionRoots.some((root) => existsSync(resolve(root, normalizedFile)));
+      const existsOnDisk = inputExistsOnDisk(normalizedFile, basePath, context);
 
       // Check if file is in prior expected outputs (priorOutputs already normalized)
       const inPriorOutputs = priorOutputs.has(normalizedFile);
@@ -566,14 +594,13 @@ export function checkTaskOrdering(
   context?: PreExecutionCheckContext,
 ): PreExecutionCheckJSON[] {
   const results: PreExecutionCheckJSON[] = [];
-  const resolutionRoots = [basePath, ...(context?.additionalRoots ?? [])];
 
   // Build map: normalized file → task index that creates it
   const fileCreators = new Map<string, { taskId: string; index: number; originalPath: string; completed: boolean }>();
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
     for (const file of task.expected_output) {
-      const normalizedFile = normalizeFilePath(file);
+      const normalizedFile = toComparisonPath(file, basePath);
       const existing = fileCreators.get(normalizedFile);
       if (!existing || (!existing.completed && task.status === "completed")) {
         fileCreators.set(normalizedFile, {
@@ -597,14 +624,14 @@ export function checkTaskOrdering(
       if (isRuntimeOnlyInput(file)) continue;
       if (!shouldValidateInputAsPath(file)) continue;
 
-      const normalizedFile = normalizeFilePath(file);
+      const normalizedFile = toComparisonPath(file, basePath);
       if (containsGlobPattern(normalizedFile)) continue;
       // A directory reference like `artifacts/M009-S03/` is never a concrete
       // read-before-create dependency: the fileCreators map is keyed by leaf
       // files, and a same-task output under the directory satisfies it.
       if (isDirectoryReference(file)) continue;
       const creator = fileCreators.get(normalizedFile);
-      const existsOnDisk = resolutionRoots.some((root) => existsSync(resolve(root, normalizedFile)));
+      const existsOnDisk = inputExistsOnDisk(normalizedFile, basePath, context);
       // Skip if the creating task has already completed — its output is available
       // regardless of disk state (e.g. file was a temp artifact cleaned up after
       // the task ran, or a replan introduced a new earlier-sequence task that

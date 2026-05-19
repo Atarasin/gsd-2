@@ -261,7 +261,13 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private readonly useSynchronizedOutput =
+		process.platform !== "win32" && process.env.PI_DISABLE_SYNC_OUTPUT !== "1";
 	private _lastRenderedComponents: string[] | null = null;
+	// Whether the previous frame composited overlays onto the screen. When true,
+	// the next frame must redraw even if component output is byte-identical —
+	// otherwise a dismissed overlay is never erased from the terminal.
+	private _lastFrameHadOverlays = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -651,10 +657,18 @@ export class TUI extends Container {
 
 		// Skip ALL post-processing if component output is unchanged.
 		// Container.render() returns the same array reference when stable.
-		if (newLines === this._lastRenderedComponents && this.overlayStack.length === 0) {
+		// Guard with _lastFrameHadOverlays: if the previous frame drew an
+		// overlay, the screen still shows it, so we must redraw to erase it
+		// even when the base component output is identical.
+		if (
+			newLines === this._lastRenderedComponents &&
+			this.overlayStack.length === 0 &&
+			!this._lastFrameHadOverlays
+		) {
 			return;
 		}
 		this._lastRenderedComponents = newLines;
+		this._lastFrameHadOverlays = this.overlayStack.length > 0;
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
@@ -673,7 +687,7 @@ export class TUI extends Container {
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
 			this.fullRedrawCount += 1;
-			let buffer = "\x1b[?2026h"; // Begin synchronized output
+			let buffer = this.useSynchronizedOutput ? "\x1b[?2026h" : ""; // Begin synchronized output
 			const startRow = Math.max(1, height - Math.max(1, newLines.length) + 1);
 			if (clear) {
 				// Clear viewport (scrollback preserved) and anchor the rendered
@@ -693,7 +707,7 @@ export class TUI extends Container {
 				}
 				buffer += line;
 			}
-			buffer += "\x1b[?2026l"; // End synchronized output
+			if (this.useSynchronizedOutput) buffer += "\x1b[?2026l"; // End synchronized output
 			this.terminal.write(buffer);
 			this.cursorRow = Math.max(0, newLines.length - 1);
 			this.hardwareCursorRow = this.cursorRow;
@@ -716,6 +730,31 @@ export class TUI extends Container {
 			const logPath = path.join(os.homedir(), ".pi", "agent", "pi-debug.log");
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
 			fs.appendFileSync(logPath, msg);
+		};
+
+		const repaintBottomAnchoredShortBlock = (): void => {
+			const startRow = Math.max(1, height - Math.max(1, newLines.length) + 1);
+			let buffer = this.useSynchronizedOutput ? "\x1b[?2026h" : "";
+			buffer += `\x1b[${startRow};1H`;
+			for (let i = 0; i < newLines.length; i++) {
+				if (i > 0) buffer += "\r\n";
+				buffer += "\x1b[2K";
+				let line = newLines[i];
+				if (!isImageLine(line) && visibleWidth(line) > width) {
+					line = truncateToWidth(line, width);
+				}
+				buffer += line;
+			}
+			if (this.useSynchronizedOutput) buffer += "\x1b[?2026l";
+			this.terminal.write(buffer);
+			this.cursorRow = Math.max(0, newLines.length - 1);
+			this.hardwareCursorRow = this.cursorRow;
+			this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+			this.previousViewportTop = getViewportTop(this.maxLinesRendered);
+			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.previousLines = newLines;
+			this.previousWidth = width;
+			this.previousHeight = height;
 		};
 
 		// First render - just output everything without clearing (assumes clean screen)
@@ -761,7 +800,7 @@ export class TUI extends Container {
 			logRedraw(`tall→tall shrink viewport realign (${this.previousLines.length} -> ${newLines.length})`);
 			const newViewportTop = getViewportTop(newLines.length);
 			const currentScreenRow = Math.max(0, hardwareCursorRow - prevViewportTop);
-			let buffer = "\x1b[?2026h";
+			let buffer = this.useSynchronizedOutput ? "\x1b[?2026h" : "";
 			if (currentScreenRow > 0) {
 				buffer += `\x1b[${currentScreenRow}A`;
 			}
@@ -776,7 +815,7 @@ export class TUI extends Container {
 				}
 				buffer += line;
 			}
-			buffer += "\x1b[?2026l";
+			if (this.useSynchronizedOutput) buffer += "\x1b[?2026l";
 			this.terminal.write(buffer);
 			this.cursorRow = newLines.length - 1;
 			this.hardwareCursorRow = newLines.length - 1;
@@ -847,10 +886,15 @@ export class TUI extends Container {
 			return;
 		}
 
+		if (appendedLines && this.previousLines.length <= height && newLines.length <= height) {
+			repaintBottomAnchoredShortBlock();
+			return;
+		}
+
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
 			if (this.previousLines.length > newLines.length) {
-				let buffer = "\x1b[?2026h";
+				let buffer = this.useSynchronizedOutput ? "\x1b[?2026h" : "";
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
 				const lineDiff = computeLineDiff(targetRow);
@@ -874,7 +918,7 @@ export class TUI extends Container {
 				if (extraLines > 0) {
 					buffer += `\x1b[${extraLines}A`;
 				}
-				buffer += "\x1b[?2026l";
+				if (this.useSynchronizedOutput) buffer += "\x1b[?2026l";
 				this.terminal.write(buffer);
 				this.cursorRow = targetRow;
 				this.hardwareCursorRow = targetRow;
@@ -914,7 +958,7 @@ export class TUI extends Container {
 
 		// Render from first changed line to end
 		// Build buffer with all updates wrapped in synchronized output
-		let buffer = "\x1b[?2026h"; // Begin synchronized output
+		let buffer = this.useSynchronizedOutput ? "\x1b[?2026h" : ""; // Begin synchronized output
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
 		if (moveTargetRow > prevViewportBottom) {
@@ -988,7 +1032,7 @@ export class TUI extends Container {
 			}
 		}
 
-		buffer += "\x1b[?2026l"; // End synchronized output
+		if (this.useSynchronizedOutput) buffer += "\x1b[?2026l"; // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = path.join(os.tmpdir(), "tui");
