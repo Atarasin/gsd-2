@@ -246,6 +246,10 @@ import type { AutoAdvanceResult, AutoOrchestrationModule, AutoOrchestratorDeps, 
 import { reconcileBeforeDispatch } from "./state-reconciliation.js";
 import { compileUnitToolContract } from "./tool-contract.js";
 import { createWorktreeSafetyModule } from "./worktree-safety.js";
+import {
+  repairAutoWorktreeSafetyFailure,
+  resolvePausedAutoWorktreePath,
+} from "./auto-worktree-repair.js";
 import { resolveManifest } from "./unit-context-manifest.js";
 import { classifyFailure } from "./recovery-classification.js";
 import { supportsStructuredQuestions } from "./workflow-mcp.js";
@@ -1730,9 +1734,16 @@ export async function pauseAuto(
   // PAUSED_SESSION_KV_KEY) instead of runtime/paused-session.json. The
   // fresh-start bootstrap below reads from the same key.
   try {
+    const pausedWorktreePath = resolvePausedAutoWorktreePath({
+      basePath: s.basePath,
+      originalBasePath: s.originalBasePath,
+      currentMilestoneId: s.currentMilestoneId,
+      isolationMode: getIsolationMode(s.originalBasePath || s.basePath),
+      baseIsAutoWorktree: isInAutoWorktree(s.basePath),
+    });
     const pausedMeta: PausedSessionMetadata = {
       milestoneId: s.currentMilestoneId ?? undefined,
-      worktreePath: isInAutoWorktree(s.basePath) ? s.basePath : null,
+      worktreePath: pausedWorktreePath,
       originalBasePath: s.originalBasePath,
       stepMode: s.stepMode,
       pausedAt: new Date().toISOString(),
@@ -2097,7 +2108,7 @@ export function createWiredAutoOrchestrationModule(
         const snapshot = await deriveState(activeBasePath);
         const milestoneId = snapshot.activeMilestone?.id ?? null;
         const expectedBranch = milestoneId ? autoWorktreeBranch(milestoneId) : null;
-        const result = safety.validateUnitRoot({
+        let result = safety.validateUnitRoot({
           unitType,
           unitId,
           writeScope,
@@ -2108,7 +2119,39 @@ export function createWiredAutoOrchestrationModule(
           expectedBranch,
         });
         if (!result.ok) {
-          return { ok: false, reason: `${result.kind}: ${result.reason}` };
+          const repaired = await repairAutoWorktreeSafetyFailure({
+            safetyResult: result,
+            projectRoot: runtimeBasePath,
+            activeRoot: activeBasePath,
+            milestoneId,
+            enterMilestone: async (id) => {
+              buildLifecycle().adoptSessionRoot(runtimeBasePath, s.originalBasePath || runtimeBasePath);
+              const enterResult = buildLifecycle().enterMilestone(id, {
+                notify: ctx.ui.notify.bind(ctx.ui),
+              });
+              if (!enterResult.ok) return { ok: false, reason: enterResult.reason };
+              rebuildScope(s.basePath, s.currentMilestoneId);
+              return { ok: true };
+            },
+            revalidate: () => safety.validateUnitRoot({
+              unitType,
+              unitId,
+              writeScope,
+              projectRoot: runtimeBasePath,
+              unitRoot: getLiveDispatchBasePath(),
+              milestoneId,
+              isolationMode: getIsolationMode(runtimeBasePath),
+              expectedBranch,
+            }),
+          });
+          result = repaired.result;
+          if (result.ok) {
+            return { ok: true, reason: repaired.repaired ? `repaired-${result.kind}` : result.kind };
+          }
+          const repairDetail = repaired.repairReason
+            ? ` (repair skipped: ${repaired.repairReason})`
+            : "";
+          return { ok: false, reason: `${result.kind}: ${result.reason}${repairDetail}` };
         }
         return { ok: true, reason: result.kind };
       },

@@ -2,6 +2,7 @@
 // File Purpose: Behavior tests for auto-loop cleanup after paused provider exits.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +11,15 @@ import { cleanupAfterLoopExit, pauseAuto, rerootCommandSession, stopAuto } from 
 import { autoSession } from "../auto-runtime-state.ts";
 import { closeDatabase, insertMilestone, insertSlice, openDatabase } from "../gsd-db.ts";
 import { getAutoWorker, registerAutoWorker } from "../db/auto-workers.ts";
+import { readPausedSessionMetadata } from "../interrupted-session.ts";
 import { WorktreeLifecycle } from "../worktree-lifecycle.ts";
+
+function runGit(args: string[], cwd: string): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
 
 test("cleanupAfterLoopExit preserves paused auto badge after provider pause", async () => {
   const base = mkdtempSync(join(tmpdir(), "gsd-paused-cleanup-"));
@@ -213,7 +222,54 @@ test("pauseAuto marks active worker as stopping and clears workerId", async () =
     assert.equal(getAutoWorker(workerId)?.status, "stopping");
   } finally {
     autoSession.reset();
-    try { closeDatabase(); } catch { /* noop */ }
+    try {
+      closeDatabase();
+    } catch {
+      /* noop */
+    }
+    process.chdir(previousCwd);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("pauseAuto records the expected worktree path when paused from project root", async () => {
+  const base = mkdtempSync(join(tmpdir(), "gsd-pause-worktree-path-"));
+  const previousCwd = process.cwd();
+
+  autoSession.reset();
+  try {
+    mkdirSync(join(base, ".gsd"), { recursive: true });
+    writeFileSync(
+      join(base, ".gsd", "PREFERENCES.md"),
+      "---\nversion: 1\ngit:\n  isolation: worktree\n---\n",
+      "utf-8",
+    );
+    runGit(["init", "-b", "main"], base);
+    runGit(["config", "user.name", "Test User"], base);
+    runGit(["config", "user.email", "test@example.com"], base);
+    writeFileSync(join(base, "README.md"), "# Test Project\n", "utf-8");
+    runGit(["add", "."], base);
+    runGit(["commit", "-m", "chore: init"], base);
+    openDatabase(join(base, ".gsd", "gsd.db"));
+    process.chdir(base);
+
+    autoSession.active = true;
+    autoSession.basePath = base;
+    autoSession.originalBasePath = base;
+    autoSession.currentMilestoneId = "M001";
+
+    await pauseAuto();
+
+    const meta = readPausedSessionMetadata(base);
+    assert.ok(meta);
+    assert.equal(meta.worktreePath, join(base, ".gsd", "worktrees", "M001"));
+  } finally {
+    autoSession.reset();
+    try {
+      closeDatabase();
+    } catch {
+      /* noop */
+    }
     process.chdir(previousCwd);
     rmSync(base, { recursive: true, force: true });
   }
