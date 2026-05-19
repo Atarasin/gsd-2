@@ -15,7 +15,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AutoSession } from "./session.js";
-import type { LoopDeps } from "./loop-deps.js";
+import type { LoopDeps, StopAutoOptions } from "./loop-deps.js";
+import type { GSDState } from "../types.js";
 import {
   MAX_LOOP_ITERATIONS,
   type LoopState,
@@ -124,6 +125,23 @@ function isDeadLocalLeaseHolder(workerId: string, projectRoot: string): boolean 
   } catch (err) {
     return (err as NodeJS.ErrnoException).code !== "EPERM";
   }
+}
+
+function resolveCompletionStopFromState(
+  stateSnapshot: GSDState | undefined,
+): { reason: string; options: StopAutoOptions } | null {
+  if (stateSnapshot?.phase !== "complete") return null;
+  const completedMilestone = stateSnapshot.lastCompletedMilestone ?? stateSnapshot.activeMilestone;
+  return {
+    reason: "All milestones complete",
+    options: {
+      completionWidget: {
+        milestoneId: completedMilestone?.id ?? null,
+        milestoneTitle: completedMilestone?.title ?? null,
+        allMilestonesComplete: true,
+      },
+    },
+  };
 }
 
 // ── Stuck detection persistence (#3704) ──────────────────────────────────
@@ -824,7 +842,12 @@ export async function autoLoop(
 
           if (orchestrationResult.kind === "stopped") {
             s.pendingOrchestrationDispatch = null;
-            await deps.stopAuto(ctx, pi, orchestrationResult.reason);
+            const completionStop = resolveCompletionStopFromState(orchestrationResult.stateSnapshot);
+            if (completionStop) {
+              await deps.stopAuto(ctx, pi, completionStop.reason, completionStop.options);
+            } else {
+              await deps.stopAuto(ctx, pi, orchestrationResult.reason);
+            }
             finishTurn("stopped", "manual-attention", "orchestration-stopped");
             break;
           }

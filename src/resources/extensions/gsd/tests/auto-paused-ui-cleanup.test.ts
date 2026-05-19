@@ -521,12 +521,12 @@ test("stopAuto completion closeout reroots session, restores cwd, and preserves 
     assert.doesNotMatch(output, /COMPLETE-MILESTONE/);
     assert.doesNotMatch(output, /\/gsd auto to resume/);
     assert.ok(
-      notifications.some(message => message.includes("Milestone M003 complete. Auto-mode finished this milestone.")),
-      "completion stop notification should describe completion, not an aborted pause",
-    );
-    assert.ok(
       notifications.every(message => !message.includes("/gsd auto to resume")),
       "completion stop notification must not tell users to resume a finished auto run",
+    );
+    assert.ok(
+      notifications.every(message => !message.includes("Auto-mode stopped") && !message.includes("Session:") && !message.includes("Debug log written")),
+      "completion stop must not append generic stop/session/debug notifications after the report",
     );
     assert.ok(
       widgetCalls.every(([key, value]) => key !== "gsd-outcome" || value === undefined),

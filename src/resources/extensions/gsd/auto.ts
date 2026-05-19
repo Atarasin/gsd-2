@@ -1478,22 +1478,24 @@ export async function stopAuto(
 
     // ── Step 8: Ledger notification ──
     try {
-      const ledger = getLedger();
-      const isAllComplete = reason === "All milestones complete";
-      const isMilestoneComplete = /^Milestone\s+\S+\s+complete$/i.test(reason ?? "");
-      const notificationPrefix = isAllComplete
-        ? "All milestones complete"
-        : isMilestoneComplete
-          ? `${reason}. Auto-mode finished this milestone`
-          : `Auto-mode stopped${reasonSuffix}`;
-      if (ledger && ledger.units.length > 0) {
-        const totals = getProjectTotals(ledger.units);
-        ctx?.ui.notify(
-          formatAutoStopNotification(notificationPrefix, totals, ledger.units.length),
-          "info",
-        );
-      } else {
-        ctx?.ui.notify(`${notificationPrefix}.`, "info");
+      if (!preserveCompletionSurface) {
+        const ledger = getLedger();
+        const isAllComplete = reason === "All milestones complete";
+        const isMilestoneComplete = /^Milestone\s+\S+\s+complete$/i.test(reason ?? "");
+        const notificationPrefix = isAllComplete
+          ? "All milestones complete"
+          : isMilestoneComplete
+            ? `${reason}. Auto-mode finished this milestone`
+            : `Auto-mode stopped${reasonSuffix}`;
+        if (ledger && ledger.units.length > 0) {
+          const totals = getProjectTotals(ledger.units);
+          ctx?.ui.notify(
+            formatAutoStopNotification(notificationPrefix, totals, ledger.units.length),
+            "info",
+          );
+        } else {
+          ctx?.ui.notify(`${notificationPrefix}.`, "info");
+        }
       }
     } catch (e) {
       debugLog("stop-cleanup-ledger", { error: e instanceof Error ? e.message : String(e) });
@@ -1569,7 +1571,7 @@ export async function stopAuto(
     try {
       if (isDebugEnabled()) {
         const logPath = writeDebugSummary();
-        if (logPath) {
+        if (logPath && !preserveCompletionSurface) {
           ctx?.ui.notify(`Debug log written → ${logPath}`, "info");
         }
       }
