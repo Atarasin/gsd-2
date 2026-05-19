@@ -6,7 +6,7 @@
  *
  * Validates inputs, checks all tasks are complete, writes slice row to DB in
  * a transaction, then (outside the transaction) renders SUMMARY.md + UAT.md
- * to disk, toggles the roadmap checkbox, stores rendered markdown in DB for
+ * to disk, regenerates the roadmap, stores rendered markdown in DB for
  * D004 recovery, and invalidates caches. Projection write failures are stale
  * projection diagnostics and do not roll back committed DB state.
  */
@@ -33,7 +33,8 @@ import { resolveCanonicalMilestoneRoot } from "../worktree-manager.js";
 import { checkOwnership, sliceUnitKey } from "../unit-ownership.js";
 import { saveFile, clearParseCache } from "../files.js";
 import { invalidateStateCache } from "../state.js";
-import { renderRoadmapCheckboxes } from "../markdown-renderer.js";
+import { renderRoadmapFromDb } from "../markdown-renderer.js";
+import { parseRoadmap } from "../parsers-legacy.js";
 import { isStaleWrite } from "../auto/turn-epoch.js";
 import { renderAllProjections } from "../workflow-projections.js";
 import { writeManifest } from "../workflow-manifest.js";
@@ -358,9 +359,12 @@ export async function handleCompleteSlice(
       return;
     }
 
-    // All guards passed — perform writes
+    // All guards passed — perform writes. Preserve existing planning metadata:
+    // completion should not overwrite title/risk/depends/demo/sequence.
     insertMilestone({ id: params.milestoneId, title: params.milestoneId });
-    insertSlice({ id: params.sliceId, milestoneId: params.milestoneId, title: params.sliceId });
+    if (!slice) {
+      insertSlice({ id: params.sliceId, milestoneId: params.milestoneId, title: params.sliceTitle || params.sliceId });
+    }
     updateSliceStatus(params.milestoneId, params.sliceId, "complete", completedAt);
   });
 
@@ -424,10 +428,10 @@ export async function handleCompleteSlice(
     await saveFile(summaryPath, summaryMd);
     await saveFile(uatPath, uatMd);
 
-    // Toggle roadmap checkbox via renderer module
-    const roadmapToggled = await renderRoadmapCheckboxes(artifactBasePath, params.milestoneId);
-    if (!roadmapToggled) {
-      logWarning("tool", `complete_slice — could not find roadmap for ${params.milestoneId}, skipping checkbox toggle`);
+    const roadmap = await renderRoadmapFromDb(artifactBasePath, params.milestoneId);
+    const roadmapSlice = parseRoadmap(roadmap.content).slices.find((slice) => slice.id === params.sliceId);
+    if (!roadmapSlice?.done) {
+      throw new Error(`roadmap render did not mark ${params.milestoneId}/${params.sliceId} complete`);
     }
   } catch (renderErr) {
     projectionStale = true;
