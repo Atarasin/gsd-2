@@ -94,7 +94,8 @@ const UNSUPPORTED_MODEL_SCOPE_RE = /\b(?:account|plan|tier|subscription)\b/i;
  *  7. Unknown
  */
 export function classifyError(errorMsg: string, retryAfterMs?: number): ErrorClass {
-  // 0. Tool-schema overload from repeated invalid tool args in preparation phase.
+  // Tool-schema overload from repeated invalid tool args in preparation phase.
+  // Checked early to prevent misclassification as unknown/provider error.
   if (TOOL_SCHEMA_RE.test(errorMsg)) {
     return { kind: "tool-schema", retryAfterMs: 0 };
   }
