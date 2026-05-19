@@ -1961,6 +1961,41 @@ export function createWiredDispatchAdapter(
   };
 }
 
+function isUsableLiveOrchestratorBasePath(basePath: string): boolean {
+  if (!basePath || !existsSync(basePath)) return false;
+  if (!detectWorktreeName(basePath)) return true;
+
+  try {
+    return readFileSync(join(basePath, ".git"), "utf8").trim().startsWith("gitdir: ");
+  } catch {
+    return false;
+  }
+}
+
+export function resolveLiveOrchestratorBasePath(input: {
+  capturedBasePath: string;
+  runtimeBasePath: string;
+  sessionBasePath?: string | null;
+  originalBasePath?: string | null;
+}): string {
+  const primary = input.sessionBasePath || input.capturedBasePath;
+  if (isUsableLiveOrchestratorBasePath(primary)) return primary;
+
+  const fallbacks = [
+    input.originalBasePath,
+    input.runtimeBasePath,
+    resolveProjectRoot(input.capturedBasePath),
+  ];
+
+  for (const candidate of fallbacks) {
+    if (candidate && isUsableLiveOrchestratorBasePath(candidate)) {
+      return candidate;
+    }
+  }
+
+  return input.runtimeBasePath || input.capturedBasePath;
+}
+
 /**
  * Thin entry glue for the new Auto Orchestration module.
  *
@@ -1976,11 +2011,19 @@ export function createWiredAutoOrchestrationModule(
 ): AutoOrchestrationModule {
   const flowId = `auto-orchestrator-${Date.now()}`;
   let seq = 0;
+  const getLiveDispatchBasePath = () =>
+    resolveLiveOrchestratorBasePath({
+      capturedBasePath: dispatchBasePath,
+      runtimeBasePath,
+      sessionBasePath: s.basePath,
+      originalBasePath: s.originalBasePath,
+    });
 
   const deps: AutoOrchestratorDeps = {
     stateReconciliation: {
       async reconcileBeforeDispatch() {
-        const result = await reconcileBeforeDispatch(dispatchBasePath);
+        const activeBasePath = getLiveDispatchBasePath();
+        const result = await reconcileBeforeDispatch(activeBasePath);
         if (result.blockers.length > 0) {
           return {
             ok: false,
@@ -2033,7 +2076,8 @@ export function createWiredAutoOrchestrationModule(
           return { ok: true, reason: "isolation-not-worktree" };
         }
         const safety = createWorktreeSafetyModule();
-        const snapshot = await deriveState(dispatchBasePath);
+        const activeBasePath = getLiveDispatchBasePath();
+        const snapshot = await deriveState(activeBasePath);
         const milestoneId = snapshot.activeMilestone?.id ?? null;
         const expectedBranch = milestoneId ? autoWorktreeBranch(milestoneId) : null;
         const result = safety.validateUnitRoot({
@@ -2041,7 +2085,7 @@ export function createWiredAutoOrchestrationModule(
           unitId,
           writeScope,
           projectRoot: runtimeBasePath,
-          unitRoot: dispatchBasePath,
+          unitRoot: activeBasePath,
           milestoneId,
           isolationMode: getIsolationMode(runtimeBasePath),
           expectedBranch,
@@ -2060,7 +2104,7 @@ export function createWiredAutoOrchestrationModule(
       },
       async preAdvanceGate() {
         try {
-          const gate = await preDispatchHealthGate(dispatchBasePath);
+          const gate = await preDispatchHealthGate(getLiveDispatchBasePath());
           if (gate.proceed) {
             return {
               kind: "pass",
@@ -2143,7 +2187,8 @@ export function createWiredAutoOrchestrationModule(
     },
     uokGate: {
       async emit(input) {
-        const prefs = loadEffectiveGSDPreferences(dispatchBasePath)?.preferences;
+        const activeBasePath = getLiveDispatchBasePath();
+        const prefs = loadEffectiveGSDPreferences(activeBasePath)?.preferences;
         const uokFlags = resolveUokFlags(prefs);
         if (!uokFlags.gates) return;
         const milestoneId = input.milestoneId ?? s.currentMilestoneId ?? undefined;
@@ -2161,7 +2206,7 @@ export function createWiredAutoOrchestrationModule(
             }),
           });
           await runner.run(input.gateId, {
-            basePath: dispatchBasePath,
+            basePath: activeBasePath,
             traceId: `pre-dispatch:${flowId}`,
             turnId: `orch-${seq}`,
             milestoneId,

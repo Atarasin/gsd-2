@@ -3,11 +3,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createAutoOrchestrator, STUCK_WINDOW_SIZE } from "../auto/orchestrator.js";
 import type { AutoOrchestratorDeps } from "../auto/contracts.js";
 import type { GSDState } from "../types.js";
-import { createWiredDispatchAdapter } from "../auto.js";
+import { createWiredDispatchAdapter, resolveLiveOrchestratorBasePath } from "../auto.js";
 import { resolveDispatch, type DispatchContext } from "../auto-dispatch.js";
 import { RuleRegistry, setRegistry, resetRegistry } from "../rule-registry.js";
 import type { UnifiedRule } from "../rule-types.js";
@@ -885,6 +888,41 @@ test("stuck-loop: journal records the stuck-loop reason on advance-blocked", asy
   }
 
   assert.ok(calls.includes("journal:advance-blocked"));
+});
+
+// ─── closeout regression: wired orchestrator must not dispatch from a removed worktree ───
+
+test("wired orchestrator base resolver prefers live project root after worktree cleanup", (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "gsd-orch-root-"));
+  const staleWorktreeRoot = join(projectRoot, ".gsd", "worktrees", "M002");
+  mkdirSync(join(staleWorktreeRoot, ".bg-shell"), { recursive: true });
+  t.after(() => { try { rmSync(projectRoot, { recursive: true, force: true }); } catch { /* */ } });
+
+  assert.equal(
+    resolveLiveOrchestratorBasePath({
+      capturedBasePath: staleWorktreeRoot,
+      runtimeBasePath: projectRoot,
+      sessionBasePath: projectRoot,
+      originalBasePath: projectRoot,
+    }),
+    projectRoot,
+  );
+});
+
+test("wired orchestrator base resolver keeps a captured active git worktree", (t) => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "gsd-orch-worktree-"));
+  const worktreeRoot = join(projectRoot, ".gsd", "worktrees", "M003");
+  mkdirSync(worktreeRoot, { recursive: true });
+  writeFileSync(join(worktreeRoot, ".git"), "gitdir: /tmp/gsd-orch-worktree/.git/worktrees/M003\n");
+  t.after(() => { try { rmSync(projectRoot, { recursive: true, force: true }); } catch { /* */ } });
+
+  assert.equal(
+    resolveLiveOrchestratorBasePath({
+      capturedBasePath: worktreeRoot,
+      runtimeBasePath: projectRoot,
+    }),
+    worktreeRoot,
+  );
 });
 
 // ─── #5789 parity: wired dispatch adapter mirrors runDispatch's resolveDispatch call ───
