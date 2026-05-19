@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { _getValidationBlockedAutoStartMessageForTest } from "../auto.ts";
+import { formatValidationBlockedMessage } from "../validation-block-guard.ts";
 import type { GSDState } from "../types.ts";
 
 function state(overrides: Partial<GSDState>): GSDState {
@@ -27,7 +27,7 @@ function state(overrides: Partial<GSDState>): GSDState {
 }
 
 test("auto-start guard blocks validation needs-attention states", () => {
-  const message = _getValidationBlockedAutoStartMessageForTest(state({
+  const message = formatValidationBlockedMessage(state({
     blockers: [
       [
         "Milestone M001 is blocked because milestone validation returned needs-attention.",
@@ -36,15 +36,15 @@ test("auto-start guard blocks validation needs-attention states", () => {
         "2. If you fixed the missing evidence or issue, re-run milestone validation: `/gsd validate-milestone`",
       ].join("\n"),
     ],
-  }));
+  }), "auto");
 
   assert.ok(message, "validation block should prevent auto-start");
-  assert.match(message, /Auto-mode was not started/);
+  assert.match(message, /\/gsd auto cannot run/);
   assert.match(message, /\/gsd validate-milestone/);
 });
 
 test("auto-start guard does not block non-validation blocked states", () => {
-  const message = _getValidationBlockedAutoStartMessageForTest(state({
+  const message = formatValidationBlockedMessage(state({
     blockers: ["No slice eligible — check dependency ordering"],
   }));
 

@@ -212,6 +212,7 @@ import { writeUnitRuntimeRecord } from "./unit-runtime.js";
 import { countPendingCaptures } from "./captures.js";
 import { CMUX_CHANNELS, type CmuxLogLevel } from "../shared/cmux-events.js";
 import { ensureDbOpen } from "./bootstrap/dynamic-tools.js";
+import { getValidationBlockMessageForBase } from "./validation-block-guard.js";
 
 function makeCmuxEmitters(pi: ExtensionAPI) {
   return {
@@ -547,40 +548,6 @@ function withDetachedAutoKeepalive<T>(run: Promise<T>): Promise<T> {
 }
 
 export const _withDetachedAutoKeepaliveForTest = withDetachedAutoKeepalive;
-
-function getValidationBlockedAutoStartMessage(state: GSDState): string | null {
-  if (state.phase !== "blocked") return null;
-  const blockers = state.blockers.filter((blocker) => blocker.trim().length > 0);
-  const validationBlocked = blockers.some((blocker) =>
-    /milestone validation returned needs-(?:attention|remediation)|validation verdict is needs-(?:attention|remediation)/i.test(blocker),
-  );
-  if (!validationBlocked) return null;
-  return [
-    "Auto-mode was not started because the active milestone is blocked by validation.",
-    ...blockers,
-  ].join("\n\n");
-}
-
-export const _getValidationBlockedAutoStartMessageForTest = getValidationBlockedAutoStartMessage;
-
-async function getAutoStartBlockedMessage(base: string): Promise<string | null> {
-  await ensureDbOpen(base);
-  let state = await deriveState(base);
-
-  if (
-    state.activeMilestone &&
-    shouldUseWorktreeIsolation(base) &&
-    !detectWorktreeName(base) &&
-    !isInAutoWorktree(base)
-  ) {
-    const wtPath = getAutoWorktreePath(base, state.activeMilestone.id);
-    if (wtPath && existsSync(wtPath)) {
-      state = await deriveState(wtPath);
-    }
-  }
-
-  return getValidationBlockedAutoStartMessage(state);
-}
 
 export function startAutoDetached(
   ctx: ExtensionCommandContext,
@@ -2527,7 +2494,7 @@ export async function startAuto(
     ctx.ui.notify("Recovered unfinished migration (.gsd.migrating → .gsd).", "info");
   }
 
-  const blockedStartMessage = await getAutoStartBlockedMessage(base);
+  const blockedStartMessage = await getValidationBlockMessageForBase(base, "auto");
   if (blockedStartMessage) {
     ctx.ui.notify(blockedStartMessage, "warning");
     debugLog("startAuto", { phase: "validation-blocked", base });

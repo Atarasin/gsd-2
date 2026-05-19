@@ -1,11 +1,18 @@
+// Project/App: GSD-2
+// File Purpose: Routes /gsd commands through global guards and command handlers.
+
 import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 
-import { GSDNoProjectError, withCommandCwd } from "./context.js";
+import { GSDNoProjectError, projectRoot, withCommandCwd } from "./context.js";
 import { handleAutoCommand } from "./handlers/auto.js";
 import { handleCoreCommand } from "./handlers/core.js";
 import { handleOpsCommand } from "./handlers/ops.js";
 import { handleParallelCommand } from "./handlers/parallel.js";
 import { handleWorkflowCommand } from "./handlers/workflow.js";
+import {
+  getValidationBlockMessageForBase,
+  isValidationBlockAllowedCommand,
+} from "../validation-block-guard.js";
 
 export async function handleGSDCommand(
   args: string,
@@ -25,6 +32,13 @@ export async function handleGSDCommand(
   let handled = false;
   try {
     handled = await withCommandCwd(ctx.cwd, async () => {
+      if (!isValidationBlockAllowedCommand(trimmed)) {
+        const blockedMessage = await getValidationBlockMessageForBase(projectRoot(), trimmed);
+        if (blockedMessage) {
+          ctx.ui.notify(blockedMessage, "warning");
+          return true;
+        }
+      }
       for (const handler of handlers) {
         if (await handler()) {
           return true;
