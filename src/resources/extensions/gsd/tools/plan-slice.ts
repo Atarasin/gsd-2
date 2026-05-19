@@ -350,7 +350,6 @@ export async function handlePlanSlice(
         observabilityImpact: params.observabilityImpact,
         targetRepositories: params.targetRepositories ?? defaultTargets,
       });
-      setSliceSketchFlag(params.milestoneId, params.sliceId, false);
 
       for (const taskId of omittedTaskIds) {
         deleteTask(params.milestoneId, params.sliceId, taskId);
