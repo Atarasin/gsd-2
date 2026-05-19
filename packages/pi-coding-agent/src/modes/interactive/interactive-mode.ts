@@ -363,6 +363,7 @@ export class InteractiveMode {
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
+	private stdinErrorHandler: ((err: Error) => void) | undefined = undefined;
 
 	// Extension widgets (components rendered above/below the editor)
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
@@ -536,6 +537,22 @@ export class InteractiveMode {
 		}
 	}
 
+	private installStdinErrorRecovery(): void {
+		if (this.stdinErrorHandler) return;
+		this.stdinErrorHandler = (err: Error) => {
+			const errno = err as NodeJS.ErrnoException;
+			const isReadEio = errno.code === "EIO" || /read EIO/i.test(err.message);
+			if (!isReadEio) return;
+
+			process.stderr.write(`[pi] stdin EIO detected, aborting active stream\n`);
+			if (this.session.isStreaming) {
+				this.agent.abort("unknown");
+				this.showWarning("Terminal input was interrupted (EIO). Aborted the active response; send your message again.");
+			}
+		};
+		process.stdin.on("error", this.stdinErrorHandler);
+	}
+
 	async init(): Promise<void> {
 		if (this.isInitialized) return;
 
@@ -641,6 +658,7 @@ export class InteractiveMode {
 
 		// Start the UI
 		this.ui.start();
+		this.installStdinErrorRecovery();
 		this.isInitialized = true;
 
 		// Set terminal title
@@ -4340,6 +4358,10 @@ export class InteractiveMode {
 		this.footerDataProvider.dispose();
 		if (this.unsubscribe) {
 			this.unsubscribe();
+		}
+		if (this.stdinErrorHandler) {
+			process.stdin.removeListener("error", this.stdinErrorHandler);
+			this.stdinErrorHandler = undefined;
 		}
 		if (this.isInitialized) {
 			this.ui.stop();
