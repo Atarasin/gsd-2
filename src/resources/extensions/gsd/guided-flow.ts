@@ -48,6 +48,7 @@ import { getIsolationMode, loadEffectiveGSDPreferences } from "./preferences.js"
 import { resolveUokFlags } from "./uok/flags.js";
 import { ensurePlanV2Graph, isMissingFinalizedContextResult } from "./uok/plan-v2.js";
 import { detectProjectState, hasGsdBootstrapArtifacts } from "./detection.js";
+import { isFutureMilestoneStatus } from "./status-guards.js";
 import { showProjectInit, offerMigration } from "./init-wizard.js";
 import { validateDirectory } from "./validate-directory.js";
 import { showConfirm } from "../shared/tui.js";
@@ -188,6 +189,11 @@ async function runQuickTaskChoice(ctx: ExtensionCommandContext, pi: ExtensionAPI
 
   const { handleQuick } = await import("./quick.js");
   await handleQuick(task, ctx, pi);
+}
+
+function isNonInteractiveContext(ctx: ExtensionCommandContext): boolean {
+  if (!ctx.hasUI) return true;
+  return process.env.GSD_HEADLESS === "1" || process.env.GSD_WEB_BRIDGE_TUI === "1";
 }
 
 /**
@@ -1042,6 +1048,7 @@ async function dispatchWorkflow(
             ? ctx.modelRegistry.getProviderAuthMode(ctx.model.provider)
             : undefined,
         baseUrl: result.appliedModel?.baseUrl ?? ctx.model?.baseUrl,
+        activeTools: typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [],
       },
     );
     if (compatibilityError) {
@@ -1296,9 +1303,11 @@ function bootstrapGsdProject(basePath: string): void {
   mkdirSync(join(root, "milestones"), { recursive: true });
   mkdirSync(join(root, "runtime"), { recursive: true });
 
-  ensureGitignore(basePath);
+  const gitPrefs = loadEffectiveGSDPreferences(basePath)?.preferences?.git;
+  const manageGitignore = gitPrefs?.manage_gitignore;
+  ensureGitignore(basePath, { manageGitignore });
   ensurePreferences(basePath);
-  untrackRuntimeFiles(basePath);
+  if (manageGitignore !== false) untrackRuntimeFiles(basePath);
 }
 
 /**
@@ -1463,6 +1472,10 @@ export async function showDiscuss(
     return;
   }
 
+  // Ensure DB is open before deriving state (#5837).
+  const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
+  await ensureDbOpen(basePath);
+
   // Invalidate caches to pick up artifacts written by a just-completed discuss/plan
   invalidateAllCaches();
 
@@ -1603,14 +1616,6 @@ export async function showDiscuss(
     }
     return;
   }
-
-  // Ensure DB is open before querying slices (#2560).
-  // showDiscuss() is a command handler — unlike tool handlers, it has no
-  // automatic ensureDbOpen() call. Without this, isDbAvailable() returns
-  // false on cold-start sessions and normSlices falls to [] → false
-  // "All slices complete" exit.
-  const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
-  await ensureDbOpen();
 
   // Guard: no roadmap yet (unless DB has slices)
   const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
@@ -2090,8 +2095,10 @@ export async function showSmartEntry(
 
   // ── Ensure .gitignore has baseline patterns ──────────────────────────
   if (!skipGitBootstrap && nativeIsRepo(basePath)) {
-    ensureGitignore(basePath);
-    untrackRuntimeFiles(basePath);
+    const gitPrefs = loadEffectiveGSDPreferences(basePath)?.preferences?.git;
+    const manageGitignore = gitPrefs?.manage_gitignore;
+    ensureGitignore(basePath, { manageGitignore });
+    if (manageGitignore !== false) untrackRuntimeFiles(basePath);
   }
 
   // Deep setup can pre-create .gsd/PREFERENCES.md before the normal init
@@ -2217,7 +2224,14 @@ export async function showSmartEntry(
       const ageMs = Date.now() - (entry.createdAt || 0);
       const manifestExists = existsSync(join(gsdRoot(basePath), "DISCUSSION-MANIFEST.json"));
       const milestoneHasContext = !!resolveMilestoneFile(basePath, entry.milestoneId, "CONTEXT");
-      if (!manifestExists && !milestoneHasContext && ageMs > 30_000) {
+      const milestoneHasRoadmap = !!resolveMilestoneFile(basePath, entry.milestoneId, "ROADMAP");
+      const milestoneRow = isDbAvailable() ? getMilestone(entry.milestoneId) : null;
+      const discussPlanComplete = milestoneHasRoadmap && !!milestoneRow && milestoneRow.status !== "queued";
+      if (discussPlanComplete) {
+        // The discuss flow already completed, but pending auto-start cleanup handshake did not run.
+        // Clear stale in-memory guard and continue through normal active-milestone routing.
+        deletePendingAutoStart(basePath);
+      } else if (!manifestExists && !milestoneHasContext && ageMs > 30_000) {
         // Stale entry from an interrupted discussion — clear and continue
         deletePendingAutoStart(basePath);
       } else {
@@ -2261,6 +2275,10 @@ export async function showSmartEntry(
         basePath
       ), "gsd-run", ctx, "discuss-milestone", { basePath });
     } else {
+      if (isNonInteractiveContext(ctx)) {
+        ctx.ui.notify(`Auto-mode stopped — ${state.nextAction || "No active milestone."}`, "info");
+        return;
+      }
       const choice = await showNextAction(ctx, {
         title: "GSD — Get Shit Done",
         summary: ["No active milestone."],
@@ -2317,6 +2335,10 @@ export async function showSmartEntry(
 
   // ── All milestones complete → New milestone ──────────────────────────
   if (state.phase === "complete") {
+    if (isNonInteractiveContext(ctx)) {
+      ctx.ui.notify("Auto-mode stopped — all milestones complete.", "info");
+      return;
+    }
     const choice = await showNextAction(ctx, {
       title: `GSD — ${milestoneId}: ${milestoneTitle}`,
       summary: ["All milestones complete."],
@@ -2422,6 +2444,41 @@ export async function showSmartEntry(
         `New milestone ${nextId}.`,
         basePath
       ), "gsd-run", ctx, "discuss-milestone", { basePath });
+    }
+    return;
+  }
+
+  if (state.phase === "blocked") {
+    const choice = await showNextAction(ctx, {
+      title: `GSD — ${milestoneId}: ${milestoneTitle}`,
+      summary: state.blockers.length > 0
+        ? state.blockers
+        : [state.nextAction || "This milestone is blocked."],
+      actions: [
+        {
+          id: "status",
+          label: "View status",
+          description: "Review the blocker and current milestone state.",
+          recommended: true,
+        },
+        {
+          id: "park",
+          label: "Park milestone",
+          description: "Explicitly defer this milestone before starting other work.",
+        },
+      ],
+      notYetMessage: "Resolve the blocker, or park the milestone explicitly.",
+    });
+
+    if (choice === "status") {
+      const { fireStatusViaCommand } = await import("./commands.js");
+      await fireStatusViaCommand(ctx);
+    } else if (choice === "park") {
+      const success = parkMilestone(basePath, milestoneId, "Validation attention deferred by user");
+      ctx.ui.notify(
+        success ? `Parked ${milestoneId}. Run /gsd unpark ${milestoneId} to reactivate.` : `Could not park ${milestoneId} — milestone not found.`,
+        success ? "info" : "warning",
+      );
     }
     return;
   }
