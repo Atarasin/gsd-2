@@ -154,7 +154,6 @@ function findOverlappingDirtyMilestonePaths(basePath: string, milestoneId: strin
     .sort();
 }
 
-
 function listStashUntrackedPaths(basePath: string, stashRef: string): string[] | null {
   const hasUntrackedParent = hasStashUntrackedParent(basePath, stashRef);
   if (hasUntrackedParent === false) return [];
