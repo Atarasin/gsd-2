@@ -23,6 +23,7 @@ import { join } from "node:path";
 
 import type { AutoSession } from "./auto/session.js";
 import { debugLog } from "./debug-logger.js";
+import { logWarning } from "./workflow-logger.js";
 import { emitJournalEvent } from "./journal.js";
 import { emitWorktreeCreated, emitWorktreeMerged } from "./worktree-telemetry.js";
 import {
@@ -520,19 +521,9 @@ export function _enterMilestoneCore(
     };
   }
 
-  if (s.isolationDegraded) {
-    debugLog("WorktreeLifecycle", {
-      action: "enterMilestone",
-      milestoneId,
-      skipped: true,
-      reason: "isolation-degraded",
-    });
-    return { ok: false, reason: "isolation-degraded" };
-  }
-
   // Phase B: claim a milestone lease before any worktree mutation. Two
   // workers cannot enter the same milestone concurrently. Best-effort:
-  // skip if no worker registered (single-worker fallback) or DB
+  // warn if no worker registered (single-worker fallback) or skip if DB
   // unavailable; reuse existing lease if we already hold it on this
   // milestone (re-entry within the same session).
   if (s.workerId) {
@@ -625,6 +616,11 @@ export function _enterMilestoneCore(
         });
       }
     }
+  } else {
+    logWarning(
+      "worktree",
+      `enterMilestone(${milestoneId}) ran before auto worker registration; milestone lease was not claimed.`,
+    );
   }
 
   // Resolve the project root for worktree operations via shared helper.
@@ -632,6 +628,38 @@ export function _enterMilestoneCore(
   // a worktree path — prevents double-nested worktree paths (#3729).
   const basePath = resolveWorktreeProjectRoot(s.basePath, s.originalBasePath);
   const mode = getIsolationMode(basePath);
+
+  if (s.isolationDegraded) {
+    if (mode === "worktree") {
+      try {
+        lifecycleEnterBranchMode(deps, basePath, milestoneId);
+        s.basePath = basePath;
+        rebuildGitService(s, deps);
+        invalidateAllCaches();
+        ctx.notify(
+          `Worktree isolation is degraded. Fell back to branch milestone/${milestoneId}.`,
+          "warning",
+        );
+        return { ok: true, mode: "branch", path: basePath };
+      } catch (err) {
+        debugLog("WorktreeLifecycle", {
+          action: "enterMilestone",
+          milestoneId,
+          skipped: true,
+          reason: "isolation-degraded",
+          fallback: "branch-failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    debugLog("WorktreeLifecycle", {
+      action: "enterMilestone",
+      milestoneId,
+      skipped: true,
+      reason: "isolation-degraded",
+    });
+    return { ok: false, reason: "isolation-degraded" };
+  }
 
   if (mode === "none") {
     debugLog("WorktreeLifecycle", {
@@ -813,8 +841,8 @@ export function _enterMilestoneCore(
 /**
  * Resolve the basePath to adopt on resume from a paused session.
  *
- * Returns `persistedWorktreePath` when the path is non-null and exists on
- * disk; otherwise falls back to `base`. Used by
+ * Returns `persistedWorktreePath` when the path is non-null and still points
+ * at a git worktree; otherwise falls back to `base`. Used by
  * `WorktreeLifecycle.resumeFromPausedSession` (#5621). Exported as a pure
  * function so unit tests can exercise the path-resolution logic without
  * constructing a `WorktreeLifecycle` instance.
@@ -827,9 +855,26 @@ export function resolvePausedResumeBasePath(
   persistedWorktreePath: string | null | undefined,
   pathExists: (p: string) => boolean = existsSync,
 ): string {
-  return persistedWorktreePath && pathExists(persistedWorktreePath)
+  return persistedWorktreePath &&
+    isValidPersistedWorktreePath(persistedWorktreePath, pathExists)
     ? persistedWorktreePath
     : base;
+}
+
+function isValidPersistedWorktreePath(
+  persistedWorktreePath: string,
+  pathExists: (p: string) => boolean,
+): boolean {
+  if (!pathExists(persistedWorktreePath)) return false;
+
+  const gitPath = join(persistedWorktreePath, ".git");
+  if (!pathExists(gitPath)) return false;
+
+  try {
+    return readFileSync(gitPath, "utf8").trim().startsWith("gitdir: ");
+  } catch {
+    return false;
+  }
 }
 
 function rebuildGitService(
@@ -1208,6 +1253,11 @@ export function mergeMilestoneStandalone(
 ): MergeStandaloneResult {
   const { originalBasePath, worktreeBasePath, milestoneId, notify } = mctx;
   validateMilestoneId(milestoneId);
+  if (!originalBasePath && !worktreeBasePath) {
+    throw new Error(
+      `Internal error: mergeMilestoneStandalone(${milestoneId}) requires originalBasePath or worktreeBasePath.`,
+    );
+  }
 
   if (mctx.isolationDegraded) {
     if (originalBasePath) {
