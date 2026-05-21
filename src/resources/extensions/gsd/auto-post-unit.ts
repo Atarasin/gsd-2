@@ -47,8 +47,9 @@ import { regenerateIfMissing } from "./workflow-projections.js";
 import { WorktreeStateProjection } from "./worktree-state-projection.js";
 import { createWorkspace, scopeMilestone } from "./workspace.js";
 import { normalizeWorktreePathForCompare } from "./worktree-root.js";
-import { isDbAvailable, getDbPath, refreshOpenDatabaseFromDisk, getTask, getSlice, getMilestone, updateTaskStatus, _getAdapter, getVerificationEvidence } from "./gsd-db.js";
-import { renderPlanCheckboxes } from "./markdown-renderer.js";
+import { isDbAvailable, getDbPath, refreshOpenDatabaseFromDisk, getTask, getSlice, getMilestone, getMilestoneSlices, updateTaskStatus, _getAdapter, getVerificationEvidence } from "./gsd-db.js";
+import { renderPlanCheckboxes, renderRoadmapFromDb } from "./markdown-renderer.js";
+import { parseRoadmap as parseLegacyRoadmap } from "./parsers-legacy.js";
 import { consumeSignal } from "./session-status-io.js";
 import {
   checkPostUnitHooks,
@@ -78,6 +79,7 @@ import { writeTurnGitTransaction } from "./uok/gitops.js";
 import { isClosedStatus } from "./status-guards.js";
 import { detectAbandonMilestone } from "./abandon-detect.js";
 import { isDeterministicPolicyError } from "./auto-tool-tracking.js";
+import { formatConnectedStepStack, formatPostUnitStatusCard } from "./auto-status-message.js";
 import {
   clearProjectResearchInflightMarker,
   finalizeProjectResearchTimeout,
@@ -86,6 +88,7 @@ import { validateArtifact } from "./schemas/validate.js";
 import { verificationRetryKey } from "./auto/verification-retry-policy.js";
 import { getLedger } from "./metrics.js";
 import { getUnitCostSpikeAction } from "./auto-budget.js";
+import { resolveCanonicalMilestoneRoot } from "./worktree-manager.js";
 
 // ─── Path Comparison Helper ───────────────────────────────────────────────
 /** Compare two paths for physical identity, tolerating trailing slashes and symlinks. */
@@ -101,6 +104,78 @@ const MAX_VERIFICATION_RETRIES = 3;
 /** Keep failure toasts short while still showing concrete examples. */
 const MAX_NOTIFICATION_DETAILS = 3;
 const NOTIFICATION_BULLET = "•";
+
+function agentEndMessagesIncludeToolCall(messages: unknown[] | undefined, toolName: string): boolean {
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const typed = part as { type?: unknown; name?: unknown };
+      if (typed.type === "toolCall" && typed.name === toolName) return true;
+    }
+  }
+  return false;
+}
+
+function agentEndMessagesIncludeSuccessfulToolResult(messages: unknown[] | undefined, toolName: string): boolean {
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const typed = message as { role?: unknown; toolName?: unknown; isError?: unknown };
+    if (typed.role === "toolResult" && typed.toolName === toolName && typed.isError !== true) return true;
+  }
+  return false;
+}
+
+function agentEndMessagesMentionTool(messages: unknown[] | undefined, toolName: string): boolean {
+  if (!Array.isArray(messages)) return false;
+  try {
+    return JSON.stringify(messages).includes(toolName);
+  } catch {
+    return false;
+  }
+}
+
+function hasIncompleteMilestoneSlice(milestoneId: string): boolean {
+  if (!isDbAvailable()) return false;
+  return getMilestoneSlices(milestoneId).some((slice) => !isClosedStatus(slice.status));
+}
+
+function hasRoadmapReassessmentArtifact(basePath: string, milestoneId: string): boolean {
+  const slicesDir = join(basePath, ".gsd", "milestones", milestoneId, "slices");
+  if (!existsSync(slicesDir)) return false;
+
+  try {
+    for (const entry of readdirSync(slicesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (existsSync(join(slicesDir, entry.name, `${entry.name}-ASSESSMENT.md`))) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function unitActivityMentionsTool(basePath: string, unitType: string, unitId: string, toolName: string): boolean {
+  const safeUnitId = unitId.replace(/\//g, "-");
+  const activityDir = join(basePath, ".gsd", "activity");
+  if (!existsSync(activityDir)) return false;
+
+  try {
+    for (const entry of readdirSync(activityDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith(`${unitType}-${safeUnitId}.jsonl`)) continue;
+      const content = readFileSync(join(activityDir, entry.name), "utf-8");
+      if (content.includes(toolName)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
 
 function formatPreExecutionCheckDetail(check: PreExecutionCheckJSON): string {
   const category = check.category?.trim() || "unknown category";
@@ -351,8 +426,10 @@ import {
   updateSliceProgressCache,
   unitVerb,
   describeNextUnit,
+  setAutoOutcomeWidget,
+  type AutoOutcomeSurfaceSnapshot,
 } from "./auto-dashboard.js";
-import { appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join, relative } from "node:path";
 import { _resetHasChangesCache } from "./native-git-bridge.js";
 import { autoCommitCurrentBranch } from "./worktree.js";
@@ -481,16 +558,83 @@ export function detectRogueFileWrites(
  */
 export const MAX_ARTIFACT_VERIFICATION_RETRIES = 3;
 
-export const STEP_COMPLETE_FALLBACK_MESSAGE =
-  "Step complete. Run /gsd next to continue one step, or /gsd auto to run continuously.";
+function buildStepCompleteCallout(
+  currentUnit?: NonNullable<AutoSession["currentUnit"]> | null,
+): string {
+  const isTask = currentUnit?.type === "execute-task";
+  const completedLabel = currentUnit ? `${unitVerb(currentUnit.type)} ${currentUnit.id}` : "Step complete";
+  return formatConnectedStepStack(`✓ GSD ${isTask ? "Task" : "Step"} Complete`, completedLabel);
+}
+
+export const STEP_COMPLETE_FALLBACK_MESSAGE = buildStepCompleteCallout();
 
 export function buildStepCompleteMessage(nextState: import("./types.js").GSDState): string | null {
   if (nextState.phase === "complete") {
     return null;
   }
+  return buildStepCompleteCallout();
+}
+
+function buildStepCompleteMessageForUnit(
+  nextState: import("./types.js").GSDState,
+  currentUnit?: NonNullable<AutoSession["currentUnit"]> | null,
+): string | null {
+  if (nextState.phase === "complete") {
+    return null;
+  }
+  return buildStepCompleteCallout(currentUnit);
+}
+
+export function buildStepCompleteOutcome(
+  nextState: import("./types.js").GSDState,
+  currentUnit?: NonNullable<AutoSession["currentUnit"]> | null,
+): AutoOutcomeSurfaceSnapshot | null {
+  if (nextState.phase === "complete") {
+    return null;
+  }
   const next = describeNextUnit(nextState);
-  return `Step complete. Next: ${next.label}\n`
-    + `Run /gsd next to continue one step, or /gsd auto to run continuously.`;
+  return {
+    status: "step",
+    title: "Step complete",
+    detail: `Next: ${next.label}.`,
+    unitLabel: currentUnit ? `${unitVerb(currentUnit.type)} ${currentUnit.id}` : null,
+    nextAction: "Advance one step, or resume automatic mode.",
+    commands: ["/gsd next", "/gsd auto", "/gsd status for overview"],
+  };
+}
+
+export function setStepCompleteSurface(
+  ctx: ExtensionContext,
+  nextState: import("./types.js").GSDState,
+  currentUnit?: NonNullable<AutoSession["currentUnit"]> | null,
+): string | null {
+  const outcome = buildStepCompleteOutcome(nextState, currentUnit);
+  if (!outcome) {
+    return null;
+  }
+  if (ctx.hasUI && typeof ctx.ui?.setWidget === "function") {
+    ctx.ui.setWidget("gsd-progress", undefined);
+  }
+  setAutoOutcomeWidget(ctx, outcome);
+  return buildStepCompleteMessageForUnit(nextState, currentUnit);
+}
+
+export function setStepCompleteFallbackSurface(
+  ctx: ExtensionContext,
+  currentUnit?: NonNullable<AutoSession["currentUnit"]> | null,
+): string {
+  if (ctx.hasUI && typeof ctx.ui?.setWidget === "function") {
+    ctx.ui.setWidget("gsd-progress", undefined);
+  }
+  setAutoOutcomeWidget(ctx, {
+    status: "step",
+    title: "Step complete",
+    detail: "State refresh failed after the unit completed.",
+    unitLabel: currentUnit ? `${unitVerb(currentUnit.type)} ${currentUnit.id}` : null,
+    nextAction: "Inspect state, then advance one step or resume automatic mode.",
+    commands: ["/gsd status for overview", "/gsd next", "/gsd auto"],
+  });
+  return buildStepCompleteCallout(currentUnit);
 }
 
 /**
@@ -572,6 +716,45 @@ function describeArtifactVerificationFailure(unitType: string, unitId: string, b
   return `Artifact verification failed: ${relPath} exists but did not satisfy the ${unitType} completion contract${expected ? ` (${expected})` : ""}.`;
 }
 
+async function repairCompleteSliceRoadmapProjection(
+  unitType: string,
+  unitId: string,
+  basePath: string,
+): Promise<boolean> {
+  if (unitType !== "complete-slice") return false;
+
+  const { milestone: mid, slice: sid } = parseUnitId(unitId);
+  if (!mid || !sid) return false;
+
+  const slice = getSlice(mid, sid);
+  if (!slice || !isClosedStatus(slice.status)) return false;
+
+  const artifactBase = resolveCanonicalMilestoneRoot(basePath, mid);
+  const summaryPath = resolveExpectedArtifactPath(unitType, unitId, artifactBase);
+  const uatPath = resolveSliceFile(artifactBase, mid, sid, "UAT");
+  if (!summaryPath || !existsSync(summaryPath) || !uatPath || !existsSync(uatPath)) {
+    return false;
+  }
+
+  const roadmapPath = resolveMilestoneFile(artifactBase, mid, "ROADMAP");
+  if (roadmapPath && existsSync(roadmapPath)) {
+    try {
+      const roadmap = parseLegacyRoadmap(readFileSync(roadmapPath, "utf-8"));
+      if (roadmap.slices.find((roadmapSlice) => roadmapSlice.id === sid)?.done) {
+        return false;
+      }
+    } catch (err) {
+      logWarning(
+        "projection",
+        `complete-slice roadmap parse failed before repair for ${mid}/${sid}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  await renderRoadmapFromDb(artifactBase, mid);
+  return true;
+}
+
 export async function autoCommitUnit(
   basePath: string,
   unitType: string,
@@ -593,7 +776,7 @@ export async function autoCommitUnit(
 
     const commitMsg = autoCommitCurrentBranch(basePath, unitType, unitId, taskContext);
     if (commitMsg) {
-      ctx?.ui.notify(`Committed: ${commitMsg.split("\n")[0]}`, "info");
+      ctx?.ui.notify(formatPostUnitStatusCard("✓ Commit", commitMsg.split("\n")[0]), "info");
     }
     return commitMsg;
   } catch (e) {
@@ -747,9 +930,9 @@ async function runCloseoutGitAction(
       s.lastGitActionStatus = "ok";
 
       if (turnAction === "commit" && gitResult.commitMessage) {
-        ctx.ui.notify(`Committed: ${gitResult.commitMessage.split("\n")[0]}`, "info");
+        ctx.ui.notify(formatPostUnitStatusCard("✓ Commit", gitResult.commitMessage.split("\n")[0]), "info");
       } else if (turnAction === "snapshot" && gitResult.snapshotLabel) {
-        ctx.ui.notify(`Snapshot recorded: ${gitResult.snapshotLabel}`, "info");
+        ctx.ui.notify(formatPostUnitStatusCard("✓ Snapshot", gitResult.snapshotLabel), "info");
       }
     }
   } catch (e) {
@@ -1193,6 +1376,27 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         debugLog("postUnit", { phase: "artifact-verify", error: String(e) });
       }
 
+      try {
+        const repairedRoadmapProjection = await repairCompleteSliceRoadmapProjection(
+          s.currentUnit.type,
+          s.currentUnit.id,
+          s.basePath,
+        );
+        if (repairedRoadmapProjection) {
+          triggerArtifactVerified = verifyExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.basePath);
+          if (triggerArtifactVerified) {
+            invalidateAllCaches();
+          }
+          debugLog("postUnit", {
+            phase: "complete-slice-roadmap-projection-repaired",
+            unitType: s.currentUnit.type,
+            unitId: s.currentUnit.id,
+          });
+        }
+      } catch (e) {
+        debugLog("postUnit", { phase: "complete-slice-roadmap-projection-repair", error: String(e) });
+      }
+
       // If verification failed, attempt to regenerate missing projection files
       // from DB data before giving up (e.g. research-slice produces PLAN from engine).
       if (!triggerArtifactVerified) {
@@ -1211,6 +1415,40 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
           } catch (e) {
             debugLog("postUnit", { phase: "artifact-verify-settle-db", error: String(e) });
           }
+        }
+      }
+
+      if (
+        !triggerArtifactVerified &&
+        s.currentUnit.type === "validate-milestone" &&
+        (
+          agentEndMessagesIncludeSuccessfulToolResult(opts?.agentEndMessages, "gsd_reassess_roadmap") ||
+          agentEndMessagesIncludeToolCall(opts?.agentEndMessages, "gsd_reassess_roadmap") ||
+          agentEndMessagesMentionTool(opts?.agentEndMessages, "gsd_reassess_roadmap") ||
+          unitActivityMentionsTool(s.basePath, s.currentUnit.type, s.currentUnit.id, "gsd_reassess_roadmap") ||
+          unitActivityMentionsTool(s.canonicalProjectRoot, s.currentUnit.type, s.currentUnit.id, "gsd_reassess_roadmap") ||
+          hasRoadmapReassessmentArtifact(s.basePath, parseUnitId(s.currentUnit.id).milestone) ||
+          hasRoadmapReassessmentArtifact(s.canonicalProjectRoot, parseUnitId(s.currentUnit.id).milestone)
+        )
+      ) {
+        const { milestone: mid } = parseUnitId(s.currentUnit.id);
+        if (mid && (
+          agentEndMessagesIncludeSuccessfulToolResult(opts?.agentEndMessages, "gsd_reassess_roadmap") ||
+          agentEndMessagesMentionTool(opts?.agentEndMessages, "gsd_reassess_roadmap") ||
+          unitActivityMentionsTool(s.basePath, s.currentUnit.type, s.currentUnit.id, "gsd_reassess_roadmap") ||
+          unitActivityMentionsTool(s.canonicalProjectRoot, s.currentUnit.type, s.currentUnit.id, "gsd_reassess_roadmap") ||
+          hasIncompleteMilestoneSlice(mid) ||
+          hasRoadmapReassessmentArtifact(s.basePath, mid) ||
+          hasRoadmapReassessmentArtifact(s.canonicalProjectRoot, mid)
+        )) {
+          triggerArtifactVerified = true;
+          invalidateAllCaches();
+          debugLog("postUnit", {
+            phase: "validate-milestone-reassessment-invalidated-validation",
+            unitType: s.currentUnit.type,
+            unitId: s.currentUnit.id,
+            milestoneId: mid,
+          });
         }
       }
 
@@ -1443,6 +1681,9 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       // of the same unit gets a full retry budget instead of the stale count.
       if (triggerArtifactVerified) {
         const retryKey = verificationRetryKey(s.currentUnit.type, s.currentUnit.id);
+        if (s.pendingVerificationRetry?.unitId === s.currentUnit.id) {
+          s.pendingVerificationRetry = null;
+        }
         s.verificationRetryCount.delete(retryKey);
         s.verificationRetryFailureHashes.delete(retryKey);
       }
@@ -1968,11 +2209,11 @@ export async function postUnitPostVerification(pctx: PostUnitContext): Promise<"
     try {
       const nextState = await deriveState(s.canonicalProjectRoot);
       phaseAfterUnit = nextState.phase;
-      const message = buildStepCompleteMessage(nextState);
+      const message = setStepCompleteSurface(ctx, nextState, s.currentUnit);
       if (message) ctx.ui.notify(message, "info");
     } catch (e) {
       debugLog("postUnit", { phase: "step-wizard-notify", error: String(e) });
-      ctx.ui.notify(STEP_COMPLETE_FALLBACK_MESSAGE, "info");
+      ctx.ui.notify(setStepCompleteFallbackSurface(ctx, s.currentUnit), "info");
     }
     return shouldReturnStepWizardAfterUnit(s.currentUnit?.type, phaseAfterUnit)
       ? "step-wizard"
