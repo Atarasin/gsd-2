@@ -160,6 +160,9 @@ import {
   isInteractiveHeadlessTool,
   isTerminalNotification,
   shouldArmHeadlessIdleTimeout,
+  hasDeterministicNoWorkTail,
+  classifyHeadlessFinalStatus,
+  shouldRestartHeadlessRun,
 } from '../headless-events.js'
 
 function makeNotify(message: string): Record<string, unknown> {
@@ -300,4 +303,75 @@ test('shouldArmHeadlessIdleTimeout: stays disarmed while interactive tools are i
 test('shouldArmHeadlessIdleTimeout: stays disarmed before any tool call has started', () => {
   assert.equal(shouldArmHeadlessIdleTimeout(0, 0), false)
   assert.equal(shouldArmHeadlessIdleTimeout(0, 1), false)
+})
+
+test('hasDeterministicNoWorkTail: detects select -> input -> notify(cancelled)', () => {
+  const recentEvents = [
+    { type: 'extension_ui_request', detail: 'select: choose milestone' },
+    { type: 'extension_ui_request', detail: 'input: provide context' },
+    { type: 'extension_ui_request', detail: 'notify: cancelled' },
+  ]
+  assert.equal(hasDeterministicNoWorkTail(recentEvents), true)
+})
+
+test('hasDeterministicNoWorkTail: returns false for non-cancelled notify', () => {
+  const recentEvents = [
+    { type: 'extension_ui_request', detail: 'select: choose milestone' },
+    { type: 'extension_ui_request', detail: 'input: provide context' },
+    { type: 'extension_ui_request', detail: 'notify: continuing' },
+  ]
+  assert.equal(hasDeterministicNoWorkTail(recentEvents), false)
+})
+
+test('classifyHeadlessFinalStatus: deterministic tail maps to no-work-deterministic', () => {
+  const status = classifyHeadlessFinalStatus({
+    blocked: false,
+    exitCode: EXIT_ERROR,
+    totalEvents: 11,
+    recentEvents: [
+      { type: 'extension_ui_request', detail: 'select: choose milestone' },
+      { type: 'extension_ui_request', detail: 'input: provide context' },
+      { type: 'extension_ui_request', detail: 'notify: cancelled' },
+    ],
+  })
+  assert.equal(status, 'no-work-deterministic')
+})
+
+test('shouldRestartHeadlessRun: deterministic no-work tail is not restartable', () => {
+  const shouldRestart = shouldRestartHeadlessRun({
+    exitCode: EXIT_ERROR,
+    interrupted: false,
+    totalEvents: 11,
+    toolCallCount: 0,
+    recentEvents: [
+      { type: 'extension_ui_request', detail: 'select: choose milestone' },
+      { type: 'extension_ui_request', detail: 'input: provide context' },
+      { type: 'extension_ui_request', detail: 'notify: cancelled' },
+    ],
+  })
+  assert.equal(shouldRestart, false)
+})
+
+test('shouldRestartHeadlessRun: events present but no tool calls → not restartable', () => {
+  // totalEvents > 0 but toolCallCount === 0: neither restart condition is met
+  const shouldRestart = shouldRestartHeadlessRun({
+    exitCode: EXIT_ERROR,
+    interrupted: false,
+    totalEvents: 6,
+    toolCallCount: 0,
+    recentEvents: [],
+  })
+  assert.equal(shouldRestart, false)
+})
+
+test('shouldRestartHeadlessRun: tool calls present but totalEvents <= 5 → not restartable', () => {
+  // toolCallCount > 0 but totalEvents is not > 5: second restart condition fails
+  const shouldRestart = shouldRestartHeadlessRun({
+    exitCode: EXIT_ERROR,
+    interrupted: false,
+    totalEvents: 4,
+    toolCallCount: 2,
+    recentEvents: [],
+  })
+  assert.equal(shouldRestart, false)
 })
