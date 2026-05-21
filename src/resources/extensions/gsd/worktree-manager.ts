@@ -1,3 +1,6 @@
+// Project/App: GSD-2
+// File Purpose: Creates, resolves, and reconciles GSD milestone worktrees.
+
 /**
  * GSD Worktree Manager
  *
@@ -172,8 +175,9 @@ export function isInsideWorktreesDir(basePath: string, targetPath: string): bool
  * Readers that cross the session/worktree boundary (validators, the bootstrap
  * audit, cross-session state queries) should route through this helper so they
  * don't silently read stale project-root state while live work sits in the
- * worktree. Writers and tools whose contract is "operate on the path I was
- * given" should NOT use this helper — they preserve the legacy behavior.
+ * worktree. Workflow artifact writers may also use it when their contract is
+ * to update the live milestone projection; generic path-local tools should
+ * preserve "operate on the path I was given" behavior.
  *
  * A stale worktree directory (no `.git` file) is treated as absent. The
  * createWorktree() path already cleans these up, but readers must not trust
@@ -241,7 +245,19 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
     const gitFilePath = join(wtPath, ".git");
     if (!existsSync(gitFilePath)) {
       logWarning("reconcile", `Removing stale worktree directory (no .git file): ${wtPath}`, { worktree: name });
-      rmSync(wtPath, { recursive: true, force: true });
+      try {
+        rmSync(wtPath, { recursive: true, force: true });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === "EPERM" || code === "EBUSY") {
+          throw new GSDError(
+            GSD_GIT_ERROR,
+            `Cannot remove stale worktree directory at ${wtPath} (${code}: directory may be locked by another process). Close editors/antivirus/git tools using this path and retry.`,
+            { cause: error as Error },
+          );
+        }
+        throw error;
+      }
     } else {
       throw new GSDError(GSD_STALE_STATE, `Worktree "${name}" already exists at ${wtPath}`);
     }
@@ -463,6 +479,10 @@ export function findNestedGitDirs(rootPath: string): string[] {
       // A .git file is a worktree pointer and is legitimate.
       // A .git directory is a standalone repo created by scaffolding.
       const innerGit = join(fullPath, ".git");
+      if (!existsSync(innerGit)) {
+        walk(fullPath, depth + 1);
+        continue;
+      }
       try {
         const innerStat = lstatSync(innerGit);
         if (innerStat.isDirectory()) {
@@ -471,9 +491,7 @@ export function findNestedGitDirs(rootPath: string): string[] {
           continue;
         }
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-          logWarning("worktree", `existsSync/.git check failed for ${fullPath}: ${(e as Error).message}`);
-        }
+        logWarning("worktree", `.git check failed for ${fullPath}: ${(e as Error).message}`);
       }
 
       walk(fullPath, depth + 1);
