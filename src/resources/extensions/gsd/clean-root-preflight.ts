@@ -427,30 +427,30 @@ export function postflightPopStash(
     if (trackedPaths !== null && untrackedPaths !== null) {
       const stashPaths = [...trackedPaths, ...untrackedPaths];
       if (stashPaths.length > 0 && stashPaths.every((path) => isGsdOwnedPath(path))) {
-      let dropped = true;
-      try {
-        execFileSync("git", ["stash", "drop", stashRef], {
-          cwd: basePath,
-          stdio: ["ignore", "pipe", "pipe"],
-          encoding: "utf-8",
-          env: GIT_NO_PROMPT_ENV,
-        });
-      } catch (err) {
-        dropped = false;
-        logWarning("preflight", `git stash drop ${stashRef} failed after skipping GSD metadata-only restore: ${err instanceof Error ? err.message : String(err)}`);
+        let dropped = true;
+        try {
+          execFileSync("git", ["stash", "drop", stashRef], {
+            cwd: basePath,
+            stdio: ["ignore", "pipe", "pipe"],
+            encoding: "utf-8",
+            env: GIT_NO_PROMPT_ENV,
+          });
+        } catch (err) {
+          dropped = false;
+          logWarning("preflight", `git stash drop ${stashRef} failed after skipping GSD metadata-only restore: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const msg = dropped
+          ? `Skipped restoring GSD metadata-only preflight stash after milestone ${milestoneId} merge.`
+          : `Skipped restoring GSD metadata-only preflight stash after milestone ${milestoneId} merge, but ${stashRef} could not be dropped and remains as a backup.`;
+        notify(msg, dropped ? "info" : "warning");
+        return {
+          restored: true,
+          needsManualRecovery: false,
+          message: msg,
+          stashRef,
+          resolution: dropped ? "already-present-dropped" : "already-present-preserved",
+        };
       }
-      const msg = dropped
-        ? `Skipped restoring GSD metadata-only preflight stash after milestone ${milestoneId} merge.`
-        : `Skipped restoring GSD metadata-only preflight stash after milestone ${milestoneId} merge, but ${stashRef} could not be dropped and remains as a backup.`;
-      notify(msg, dropped ? "info" : "warning");
-      return {
-        restored: true,
-        needsManualRecovery: false,
-        message: msg,
-        stashRef,
-        resolution: dropped ? "already-present-dropped" : "already-present-preserved",
-      };
-    }
     }
     execFileSync("git", ["stash", "apply", stashRef], {
       cwd: basePath,
