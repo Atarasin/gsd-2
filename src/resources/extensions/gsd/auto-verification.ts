@@ -14,7 +14,7 @@
  */
 
 import type { ExtensionContext, ExtensionAPI } from "@gsd/pi-coding-agent";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { gsdProjectionRoot, resolveSliceFile, resolveSlicePath, resolveMilestoneFile } from "./paths.js";
 import { resolveCanonicalMilestoneRoot } from "./worktree-manager.js";
 import { parseUnitId } from "./unit-id.js";
@@ -39,6 +39,7 @@ import { writeVerificationJSON, type PostExecutionCheckJSON, type EvidenceJSON }
 import { logWarning } from "./workflow-logger.js";
 import { runPostExecutionChecks, type PostExecutionResult } from "./post-execution-checks.js";
 import type { AutoSession } from "./auto/session.js";
+import type { ErrorContext } from "./auto/types.js";
 import type { VerificationResult as VerificationGateResult } from "./types.js";
 import { join } from "node:path";
 import { resolveUokFlags } from "./uok/flags.js";
@@ -50,6 +51,7 @@ import type { SliceRow } from "./db-task-slice-rows.js";
 import { getSlice } from "./gsd-db.js";
 import { getLedger } from "./metrics.js";
 import { getUnitCostSpikeAction } from "./auto-budget.js";
+import { formatPostUnitStatusCard } from "./auto-status-message.js";
 
 export interface VerificationContext {
   s: AutoSession;
@@ -58,6 +60,7 @@ export interface VerificationContext {
 }
 
 export type VerificationResult = "continue" | "retry" | "pause";
+type PauseAutoFn = (ctx?: ExtensionContext, pi?: ExtensionAPI, errorContext?: ErrorContext) => Promise<void>;
 
 function getCurrentUnitCostStats(unitId: string): { unitCostUsd: number; rollingAvgUsd: number } {
   const ledger = getLedger();
@@ -126,6 +129,56 @@ function hasExplicitVerificationTargets(task: TaskRow | null, slice: SliceRow | 
   return Boolean(task?.target_repositories?.length || slice?.target_repositories?.length);
 }
 
+function messagesMentionTool(messages: unknown[] | null | undefined, toolName: string): boolean {
+  if (!Array.isArray(messages)) return false;
+  try {
+    return JSON.stringify(messages).includes(toolName);
+  } catch {
+    return false;
+  }
+}
+
+function unitActivityMentionsTool(basePath: string, unitType: string, unitId: string, toolName: string): boolean {
+  const safeUnitId = unitId.replace(/\//g, "-");
+  const activityDir = join(basePath, ".gsd", "activity");
+  if (!existsSync(activityDir)) return false;
+
+  try {
+    for (const entry of readdirSync(activityDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith(`${unitType}-${safeUnitId}.jsonl`)) continue;
+      if (readFileSync(join(activityDir, entry.name), "utf-8").includes(toolName)) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function hasRoadmapReassessmentArtifact(basePath: string, milestoneId: string): boolean {
+  const slicesDir = join(basePath, ".gsd", "milestones", milestoneId, "slices");
+  if (!existsSync(slicesDir)) return false;
+
+  try {
+    for (const entry of readdirSync(slicesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (existsSync(join(slicesDir, entry.name, `${entry.name}-ASSESSMENT.md`))) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function hasReassessmentEvidence(s: AutoSession, milestoneId: string): boolean {
+  if (!s.currentUnit) return false;
+  const toolName = "gsd_reassess_roadmap";
+  const roots = [...new Set([s.basePath, s.canonicalProjectRoot].filter(Boolean))];
+  return messagesMentionTool(s.lastUnitAgentEndMessages, toolName)
+    || roots.some((root) => unitActivityMentionsTool(root, s.currentUnit!.type, s.currentUnit!.id, toolName))
+    || roots.some((root) => hasRoadmapReassessmentArtifact(root, milestoneId));
+}
+
 
 /**
  * Post-unit guard for `validate-milestone` units (#4094).
@@ -144,7 +197,7 @@ function hasExplicitVerificationTargets(task: TaskRow | null, slice: SliceRow | 
  */
 async function runValidateMilestonePostCheck(
   vctx: VerificationContext,
-  pauseAuto: (ctx?: ExtensionContext, pi?: ExtensionAPI) => Promise<void>,
+  pauseAuto: PauseAutoFn,
 ): Promise<VerificationResult> {
   const { s, ctx, pi } = vctx;
   const prefs = loadEffectiveGSDPreferences()?.preferences;
@@ -183,8 +236,14 @@ async function runValidateMilestonePostCheck(
   const { milestone: mid } = parseUnitId(s.currentUnit.id);
   if (!mid) return "continue";
 
+  const retryKey = verificationRetryKey(s.currentUnit.type, s.currentUnit.id);
+  const clearValidationRetry = (): void => {
+    s.pendingVerificationRetry = null;
+    s.verificationRetryCount.delete(retryKey);
+    s.verificationRetryFailureHashes.delete(retryKey);
+  };
+
   const setToolFailureRetry = (message: string): VerificationResult => {
-    const retryKey = verificationRetryKey(s.currentUnit!.type, s.currentUnit!.id);
     const attempt = (s.verificationRetryCount.get(retryKey) ?? 0) + 1;
     s.verificationRetryCount.set(retryKey, attempt);
     s.pendingVerificationRetry = {
@@ -195,6 +254,14 @@ async function runValidateMilestonePostCheck(
     return "retry";
   };
 
+  const reassessmentInvalidatedValidation = async (): Promise<boolean> => {
+    if (!hasReassessmentEvidence(s, mid)) return false;
+    const incompleteSliceCount = await countIncompleteSlices(s.canonicalProjectRoot, mid);
+    const hasAssessmentArtifact = [s.basePath, s.canonicalProjectRoot]
+      .some((root) => hasRoadmapReassessmentArtifact(root, mid));
+    return incompleteSliceCount > 0 || hasAssessmentArtifact;
+  };
+
   const validationBasePath = resolveCanonicalMilestoneRoot(s.basePath, mid);
   const validationFile = join(
     gsdProjectionRoot(validationBasePath),
@@ -203,6 +270,10 @@ async function runValidateMilestonePostCheck(
     `${mid}-VALIDATION.md`,
   );
   if (!validationFile) {
+    if (await reassessmentInvalidatedValidation()) {
+      clearValidationRetry();
+      return "continue";
+    }
     return setToolFailureRetry(
       "You must call gsd_validate_milestone to persist the validation results. No VALIDATION.md was created.",
     );
@@ -210,6 +281,10 @@ async function runValidateMilestonePostCheck(
 
   const validationContent = await loadFile(validationFile);
   if (!validationContent) {
+    if (await reassessmentInvalidatedValidation()) {
+      clearValidationRetry();
+      return "continue";
+    }
     return setToolFailureRetry(
       "You must call gsd_validate_milestone to persist the validation results. VALIDATION.md exists but is empty.",
     );
@@ -238,7 +313,10 @@ async function runValidateMilestonePostCheck(
       `Milestone ${mid} validation returned needs-attention`,
       mid,
     );
-    await pauseAuto(ctx, pi);
+    await pauseAuto(ctx, pi, {
+      message: `Milestone ${mid} validation needs attention.`,
+      category: "unknown",
+    });
     return "pause";
   }
 
@@ -284,7 +362,10 @@ async function runValidateMilestonePostCheck(
     `No incomplete slices found for ${mid} while verdict=needs-remediation`,
     mid,
   );
-  await pauseAuto(ctx, pi);
+  await pauseAuto(ctx, pi, {
+    message: `Milestone ${mid} validation needs remediation but no remediation slices were added.`,
+    category: "unknown",
+  });
   return "pause";
 }
 
@@ -327,7 +408,7 @@ async function countIncompleteSlices(basePath: string, milestoneId: string): Pro
  */
 export async function runPostUnitVerification(
   vctx: VerificationContext,
-  pauseAuto: (ctx?: ExtensionContext, pi?: ExtensionAPI) => Promise<void>,
+  pauseAuto: PauseAutoFn,
 ): Promise<VerificationResult> {
   const { s, ctx, pi } = vctx;
 
@@ -366,7 +447,10 @@ export async function runPostUnitVerification(
     const explicitVerificationTargetsRequested = hasExplicitVerificationTargets(taskRow, sliceRow);
     if (explicitVerificationTargetsRequested && verificationTargets.length === 0) {
       logWarning("engine", "verification: explicit target_repositories requested but no repositories resolved");
-      await pauseAuto(ctx, pi);
+      await pauseAuto(ctx, pi, {
+        message: "Verification failed: no runnable host-owned verification checks were discovered.",
+        category: "unknown",
+      });
       return "pause";
     }
     const result = verificationTargets.length <= 1
@@ -451,11 +535,11 @@ export async function runPostUnitVerification(
       const passCount = result.checks.filter((c) => c.exitCode === 0).length;
       const total = result.checks.length;
       if (result.passed) {
-        ctx.ui.notify(`Verification gate: ${passCount}/${total} checks passed`);
+        ctx.ui.notify(formatPostUnitStatusCard("✓ Verification Gate", `${passCount}/${total} checks passed`));
       } else {
         const failures = result.checks.filter((c) => c.exitCode !== 0);
         const failNames = failures.map((f) => f.command).join(", ");
-        ctx.ui.notify(`Verification gate: FAILED — ${failNames}`);
+        ctx.ui.notify(formatPostUnitStatusCard("✕ Verification Gate", `FAILED — ${failNames}`));
         process.stderr.write(
           `verification-gate: ${total - passCount}/${total} checks failed\n`,
         );
@@ -714,7 +798,10 @@ export async function runPostUnitVerification(
         "error",
       );
       process.stderr.write(`verification-gate: ${verdict.failureContext}\n`);
-      await pauseAuto(ctx, pi);
+      await pauseAuto(ctx, pi, {
+        message: "Verification failed: no runnable host-owned verification checks were discovered.",
+        category: "unknown",
+      });
       return "pause";
     } else if (postExecBlockingFailure) {
       // Post-execution failures are cross-task consistency issues — retrying the same task won't fix them.
@@ -726,7 +813,10 @@ export async function runPostUnitVerification(
         `Post-execution checks failed — cross-task consistency issue detected, pausing for human review`,
         "error",
       );
-      await pauseAuto(ctx, pi);
+      await pauseAuto(ctx, pi, {
+        message: "Post-execution checks failed: cross-task consistency issue detected.",
+        category: "unknown",
+      });
       return "pause";
     } else if (autoFixEnabled && attempt + 1 <= maxRetries) {
       const { unitCostUsd, rollingAvgUsd } = getCurrentUnitCostStats(s.currentUnit.id);
@@ -742,19 +832,17 @@ export async function runPostUnitVerification(
           `Unit ${s.currentUnit.id} hit per-unit cap $${perUnitCapUsd.toFixed(2)} — pausing auto-mode.`,
           "error",
         );
-        await pauseAuto(ctx, pi);
+        await pauseAuto(ctx, pi, {
+          message: `Verification failed and unit ${s.currentUnit.id} hit per-unit cap $${perUnitCapUsd.toFixed(2)}.`,
+          category: "unknown",
+        });
         return "pause";
       }
       if (getUnitCostSpikeAction(unitCostUsd, rollingAvgUsd, 3.0) === "pause") {
-        s.verificationRetryCount.delete(retryKey);
-        s.verificationRetryFailureHashes.delete(retryKey);
-        s.pendingVerificationRetry = null;
         ctx.ui.notify(
-          `Unit ${s.currentUnit.id} cost spike detected (${unitCostUsd.toFixed(2)} vs avg ${rollingAvgUsd.toFixed(2)}) — pausing auto-mode.`,
-          "error",
+          `Unit ${s.currentUnit.id} cost spike detected (${unitCostUsd.toFixed(2)} vs avg ${rollingAvgUsd.toFixed(2)}) during verification retry; keeping verification failure as the authoritative blocker.`,
+          "warning",
         );
-        await pauseAuto(ctx, pi);
-        return "pause";
       }
       const nextAttempt = attempt + 1;
       s.verificationRetryCount.set(retryKey, nextAttempt);
@@ -790,7 +878,10 @@ export async function runPostUnitVerification(
         `Verification gate FAILED after ${attempt} ${attempt === 1 ? "retry" : "retries"} (${exhaustedSummary}) — pausing for human review`,
         "error",
       );
-      await pauseAuto(ctx, pi);
+      await pauseAuto(ctx, pi, {
+        message: `Verification gate failed after ${attempt} ${attempt === 1 ? "retry" : "retries"} (${exhaustedSummary}).`,
+        category: "unknown",
+      });
       return "pause";
     }
   } catch (err) {
@@ -799,7 +890,10 @@ export async function runPostUnitVerification(
       `Verification gate errored before producing an authoritative verdict: ${(err as Error).message}`,
       "error",
     );
-    await pauseAuto(ctx, pi);
+    await pauseAuto(ctx, pi, {
+      message: `Verification gate errored before producing an authoritative verdict: ${(err as Error).message}`,
+      category: "unknown",
+    });
     return "pause";
   }
 }
