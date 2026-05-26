@@ -1,11 +1,13 @@
 // GSD2 - Dev CLI child-process spawn helpers.
 
+import { pathToFileURL } from 'node:url'
+
 export function buildDevCliSpawnArgs({
   resolveTsPath,
   srcLoaderPath,
   argv,
 }) {
-  return ['--import', resolveTsPath, '--experimental-strip-types', srcLoaderPath, ...argv]
+  return ['--import', pathToFileURL(resolveTsPath).href, '--experimental-strip-types', srcLoaderPath, ...argv]
 }
 
 export function buildDevCliChildEnv(baseEnv, devCliPath) {

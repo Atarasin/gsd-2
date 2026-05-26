@@ -21,6 +21,23 @@ export const KIMI_CODING_MODELS = {
 			contextWindow: 262144,
 			maxTokens: 32768,
 		} satisfies Model<"anthropic-messages">,
+		"kimi-for-coding": {
+			id: "kimi-for-coding",
+			name: "kimi-for-coding",
+			api: "anthropic-messages",
+			provider: "kimi-coding",
+			baseUrl: "https://api.kimi.com/coding",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 262144,
+			maxTokens: 32768,
+		} satisfies Model<"anthropic-messages">,
 		"kimi-k2-thinking": {
 			id: "kimi-k2-thinking",
 			name: "Kimi K2 Thinking",
